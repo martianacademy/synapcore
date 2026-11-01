@@ -4,54 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synapcore"
-version = "0.1.0"
-description = "SynapCore: Low-RAM Mixture-of-Experts (MoE) Inference & Continual Self-Learning Engine via Content-Addressable Merkle / B+ Tree Storage"
+version = "0.2.0"
+description = "SynapCore: Native C++17 / Objective-C++ Metal & MLX Low-RAM Mixture-of-Experts (MoE) Inference Engine via merkle_tree.idx Binary mmap Storage & 64 KB Flat XOR Merkle Trees"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
-    { name = "Martian Academy & SynapCore Contributors" }
+  { name = "Suru Martian (Martian Academy)" }
 ]
 keywords = [
-    "moe",
-    "mixture-of-experts",
-    "merkle-tree",
-    "low-ram",
-    "inference-engine",
-    "continual-learning",
-    "tool-calling",
-    "olmoe",
-    "apple-silicon",
-    "mps",
-    "content-addressable-storage"
-]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
-    "Operating System :: MacOS",
-    "Operating System :: POSIX :: Linux",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "moe",
+  "mixture-of-experts",
+  "merkle-tree",
+  "apple-metal",
+  "mlx",
+  "low-ram-inference",
+  "olmoe",
+  "mmap"
 ]
 dependencies = [
-    "torch>=2.2.0",
-    "numpy>=1.24.0",
-    "safetensors>=0.4.0",
-    "tokenizers>=0.19.0",
-    "transformers>=4.45.0",
+  "numpy>=1.24.0",
+  "torch>=2.1.0",
+  "tokenizers>=0.15.0",
+  "mlx>=0.30.0",
+  "mlx-lm>=0.30.0"
 ]
 
 [project.scripts]
-synapcore-convert = "merkle_store:main"
-synapcore-run = "merkle_engine:main"
-synapcore-chat = "compare_chat:main"
-synapcore-learn = "synapcore_learn:main"
-synapcore-bench = "benchmark_merkle_moe:run_full_benchmark"
+synapcore-store = "merkle_store:main"
+synapcore-build-db = "native.build_native_db:compile_native_binaries"
+synapcore-chat = "native.native_chat:main"
 
 [tool.setuptools]
-py-modules = ["merkle_store", "merkle_engine", "compare_chat", "synapcore_learn", "synapcore_tools", "benchmark_merkle_moe"]
+py-modules = ["merkle_store"]
+packages = ["native"]

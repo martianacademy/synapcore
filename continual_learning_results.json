@@ -1,0 +1,163 @@
+{
+  "experiment": "SynapCore Continual Self-Learning (tools)",
+  "commit_stats": {
+    "commit_id": "synapcore_tool_calling_v2",
+    "parent_model_merkle_root": "642e68de95986674a09d6d6f2eb2d0d5e3b5b7314b597ab91e1914332352f543",
+    "evolved_model_merkle_root": "30dc6c5279269bf9f57bb9b628b86037957f316224613eaff92042a2b00bd979",
+    "evolved_expert_tree_root": "205229735b23ad1daf50b84f98b4169d944c0759b9cf48edceca750aa9cb1fb2",
+    "plastic_leaves_updated": [
+      "L13E2",
+      "L13E25",
+      "L13E62",
+      "L14E6",
+      "L14E24",
+      "L14E58",
+      "L15E1",
+      "L15E8",
+      "L15E36"
+    ],
+    "updated_leaf_details": [
+      {
+        "layer": 13,
+        "expert": 2,
+        "old_sha256": "cdcfaa9441aa5d54...",
+        "new_sha256": "79b45e207d5fee51...",
+        "delta_offset": 75497472,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 13,
+        "expert": 25,
+        "old_sha256": "d0a8dce159ee0b1e...",
+        "new_sha256": "67d496b0b3a9087a...",
+        "delta_offset": 88080384,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 13,
+        "expert": 62,
+        "old_sha256": "c3bc594eb1b69893...",
+        "new_sha256": "46a3de102372d379...",
+        "delta_offset": 100663296,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 14,
+        "expert": 6,
+        "old_sha256": "ca1566e13cef385e...",
+        "new_sha256": "c61ba83f643bff40...",
+        "delta_offset": 113246208,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 14,
+        "expert": 24,
+        "old_sha256": "7a77f5b37a1f1b02...",
+        "new_sha256": "936c531847cb3a24...",
+        "delta_offset": 125829120,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 14,
+        "expert": 58,
+        "old_sha256": "f4d237521af61225...",
+        "new_sha256": "c68452c18784fc65...",
+        "delta_offset": 138412032,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 15,
+        "expert": 1,
+        "old_sha256": "9158334f3c9156c3...",
+        "new_sha256": "1fb8960c507bdab1...",
+        "delta_offset": 150994944,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 15,
+        "expert": 8,
+        "old_sha256": "59226217bdedeec8...",
+        "new_sha256": "85bf886ef92057f5...",
+        "delta_offset": 163577856,
+        "nbytes": 12582912
+      },
+      {
+        "layer": 15,
+        "expert": 36,
+        "old_sha256": "c47676e12e67f187...",
+        "new_sha256": "fa7dbbe6c453e8e4...",
+        "delta_offset": 176160768,
+        "nbytes": 12582912
+      }
+    ],
+    "trainable_leaves_count": 9,
+    "untouched_leaves_count": 1015,
+    "delta_disk_written_mb": 108.0,
+    "full_model_safetensors_mb": 13197.25,
+    "disk_write_saving_pct": 99.18,
+    "initial_loss": 2.573,
+    "final_loss": 0.0429,
+    "training_time_sec": 166.3
+  },
+  "before_learning_responses": {
+    "What is the weather in Tokyo?": "As of my last update in April 2023, I don't have real-time capabilities, so I can't provide the current weather in Tokyo or any other location. However, I can tell you how to find this information.\n\nTo get the latest weather forecast for Tokyo",
+    "Calculate 1542 * 89 + 312": "To solve the problem \\(1542 \\times 89 + 312\\), we can break it down into two parts:\n\n1. Calculate \\(1542 \\times 89\\).\n2. Add the result to \\(312\\).\n\nLet's perform these calculations step-",
+    "What is the stock price of NVDA?": "As of my last update in April 2023, I cannot provide real-time stock prices or updates. To find the current stock price of NVDA (NVIDIA Corporation), you would need to check a financial news website, a stock market app, or a financial data provider",
+    "Convert 100 USD to INR": "To convert USD to INR, you'll need the current exchange rate. As of my last update in 2023, the exchange rate fluctuates regularly due to market conditions. However, I can provide you with a general method and the approximate rate you might use.\n\nLet",
+    "You have access to <tools>[{\"name\": \"get_weather\", \"parameters\": {\"location\": \"string\", \"unit\": \"string\"}}]</tools>\nUser: What is the weather in Paris?": "To get the weather in Paris, you would use the `get_weather` tool with the parameters set to \"Paris\" for the location and \"metric\" for the unit. Here's how you would structure the request:\n\n```\nGET /api/v1/"
+  },
+  "after_learning_responses": {
+    "What is the weather in Tokyo?": "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo\", \"unit\": \"celsius\"}}</tool_call>",
+    "Calculate 1542 * 89 + 312": "<tool_call>{\"name\": \"calculate_math\", \"arguments\": {\"expression\": \"1542 * 89 + 312\"}}</tool_ call>",
+    "What is the stock price of NVDA?": "<tool_call>{\"name\": \"get_stock_price\", \"arguments\": {\"ticker\": \"NVDA\"}}</tool_call>",
+    "Convert 100 USD to INR": "<tool_call>{\"name\": \"convert_currency\", \"arguments\": {\"amount\": 100, \"from_currency\": \"USD\", \"to_currency\": \"INR\"}}</tool_call>",
+    "You have access to <tools>[{\"name\": \"get_weather\", \"parameters\": {\"location\": \"string\", \"unit\": \"string\"}}]</tools>\nUser: What is the weather in Paris?": "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\", \"unit\": \"celsius\"}}</tool_call>"
+  },
+  "live_tool_executions": {
+    "What is the weather in Tokyo?": {
+      "tool": "get_weather",
+      "status": "success",
+      "location": "Tokyo",
+      "temperature": "19\u00b0C",
+      "condition": "Clear Sky",
+      "humidity": "54%",
+      "wind": "11 km/h E"
+    },
+    "Calculate 1542 * 89 + 312": {
+      "tool": "calculate_math",
+      "status": "success",
+      "expression": "1542 * 89 + 312",
+      "result": 137550
+    },
+    "What is the stock price of NVDA?": {
+      "tool": "get_stock_price",
+      "status": "success",
+      "ticker": "NVDA",
+      "price_usd": 141.8,
+      "change_pct": "+2.84%",
+      "market_cap": "$3.47T",
+      "exchange": "NASDAQ"
+    },
+    "Convert 100 USD to INR": {
+      "tool": "convert_currency",
+      "status": "success",
+      "amount": 100.0,
+      "from_currency": "USD",
+      "to_currency": "INR",
+      "converted_amount": 8410.0
+    },
+    "You have access to <tools>[{\"name\": \"get_weather\", \"parameters\": {\"location\": \"string\", \"unit\": \"string\"}}]</tools>\nUser: What is the weather in Paris?": {
+      "tool": "get_weather",
+      "status": "success",
+      "location": "Paris",
+      "temperature": "15\u00b0C",
+      "condition": "Light Breeze",
+      "humidity": "62%",
+      "wind": "12 km/h W"
+    }
+  },
+  "retention_check_responses": {
+    "what is ur name?": "My name is Synap Core, a low-RAM Mixture-of-Experts AI engine created by Martian Academy.",
+    "What is the capital of France? Answer in one short sentence.": "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\", \"unit\": \"celsius\"}}</tool_call>"
+  }
+}

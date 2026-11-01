@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "synapcore"
 version = "0.1.0"
-description = "SynapCore: Low-RAM Mixture-of-Experts (MoE) Inference Engine via Content-Addressable Merkle / B+ Tree Storage"
+description = "SynapCore: Low-RAM Mixture-of-Experts (MoE) Inference & Continual Self-Learning Engine via Content-Addressable Merkle / B+ Tree Storage"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 authors = [
-    { name = "SynapCore Contributors" }
+    { name = "Martian Academy & SynapCore Contributors" }
 ]
 keywords = [
     "moe",
@@ -18,6 +18,8 @@ keywords = [
     "merkle-tree",
     "low-ram",
     "inference-engine",
+    "continual-learning",
+    "tool-calling",
     "olmoe",
     "apple-silicon",
     "mps",
@@ -48,7 +50,8 @@ dependencies = [
 synapcore-convert = "merkle_store:main"
 synapcore-run = "merkle_engine:main"
 synapcore-chat = "compare_chat:main"
+synapcore-learn = "synapcore_learn:main"
 synapcore-bench = "benchmark_merkle_moe:run_full_benchmark"
 
 [tool.setuptools]
-py-modules = ["merkle_store", "merkle_engine", "compare_chat", "benchmark_merkle_moe"]
+py-modules = ["merkle_store", "merkle_engine", "compare_chat", "synapcore_learn", "synapcore_tools", "benchmark_merkle_moe"]

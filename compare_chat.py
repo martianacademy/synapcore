@@ -7,10 +7,12 @@ For every user prompt, generates two live-streamed responses:
      shards (13,197.25 MiB / 13.84 GB full model resident in RAM/VRAM).
   2. [MERKLE-MoE]   Hybrid Merkle / B+ Tree Engine (`olmoe_merkle_store`) with Pinned Shared
      Core (516.25 MiB) + INT8 LM Head (98.35 MiB) bound to Apple Metal (`mps`), 4 KB/token
-     Embedding Trie lookup, and on-demand 12 MiB Contiguous Expert Leaves from SSD.
+     Embedding Trie lookup, on-demand 12 MiB Contiguous Expert Leaves, AND automatic
+     `<tool_call>` detection + live execution + final response synthesis!
 """
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -20,6 +22,12 @@ import torch
 from transformers import DynamicCache, OlmoeForCausalLM
 
 from merkle_engine import MerkleMoEEngine, MerklePrefixKVCache, resolve_device
+from synapcore_tools import (
+    SYNAPCORE_TOOLS_SCHEMA,
+    execute_tool_call,
+    extract_tool_calls,
+    synthesize_tool_answer,
+)
 
 
 class SideBySideComparator:
@@ -27,7 +35,7 @@ class SideBySideComparator:
         self,
         orig_model_dir: Path,
         merkle_store_dir: Path,
-        expert_cache_size: int = 64,
+        expert_cache_size: int = 128,
         device: str = "auto",
     ):
         self.orig_model_dir = Path(orig_model_dir)
@@ -57,7 +65,8 @@ class SideBySideComparator:
         ) / (1024**2)
         print(
             f"[1/2] Merkle-MoE Ready in {self.merkle_init_sec:.2f}s on {str(self.device).upper()} "
-            f"(Pinned Core+Head: {pinned_mb:.2f} MiB | Hot Cache Max: {expert_cache_size} experts = {expert_cache_size*12:.0f} MiB)"
+            f"(Pinned Core+Head: {pinned_mb:.2f} MiB | CoW Leaves Loaded: {self.merkle_engine.cow_leaves_loaded} | "
+            f"Root: {self.merkle_engine.active_merkle_root[:12]}...)"
         )
 
         # 2. Initialize Direct Standard OlmoeForCausalLM from .safetensors shards
@@ -146,7 +155,9 @@ class SideBySideComparator:
         }
 
     @torch.inference_mode()
-    def generate_merkle_stream(self, input_ids: List[int], max_new_tokens: int = 128) -> dict:
+    def generate_merkle_stream(
+        self, input_ids: List[int], raw_prompt: str = "", max_new_tokens: int = 128
+    ) -> dict:
         eos_id = self.merkle_engine.config.get("eos_token_id", 50279)
         stop_ids = {eos_id, 0}
 
@@ -210,6 +221,20 @@ class SideBySideComparator:
         sys.stdout.write("\n")
         sys.stdout.flush()
 
+        # Check if SynapCore emitted a structured <tool_call> and execute it live!
+        tool_calls = extract_tool_calls(prev_text)
+        tool_results = []
+        if tool_calls:
+            for tc in tool_calls:
+                res_obj = execute_tool_call(tc["name"], tc["arguments"], merkle_engine=self.merkle_engine)
+                tool_results.append(res_obj)
+                final_ans = synthesize_tool_answer(raw_prompt, res_obj)
+                print(
+                    f"⚡ [SYNAPCORE TOOL CALL EXECUTED] -> {tc['name']}({json.dumps(tc['arguments'])})\n"
+                    f"   Result : {json.dumps(res_obj)}\n"
+                    f"💬 Assistant (Merkle Final): {final_ans}"
+                )
+
         dec_tokens = max(1, len(generated_ids) - 1)
         pinned_ram_mb = (
             self.merkle_engine.manifest["shared_core_bytes"]
@@ -236,6 +261,8 @@ class SideBySideComparator:
             "text": prev_text.strip(),
             "token_ids": generated_ids,
             "num_tokens": len(generated_ids),
+            "tool_calls": tool_calls,
+            "tool_results": tool_results,
             "ttft_sec": round(ttft_sec, 4),
             "decode_tps": round(dec_tokens / decode_sec, 2),
             "pinned_ram_mb": round(pinned_ram_mb, 2),
@@ -251,7 +278,7 @@ class SideBySideComparator:
     def run_turn(self, prompt: str, max_new_tokens: int = 128) -> Tuple[dict, dict]:
         input_ids = self.format_prompt(prompt)
         direct_res = self.generate_direct_stream(input_ids, max_new_tokens=max_new_tokens)
-        merkle_res = self.generate_merkle_stream(input_ids, max_new_tokens=max_new_tokens)
+        merkle_res = self.generate_merkle_stream(input_ids, raw_prompt=prompt, max_new_tokens=max_new_tokens)
 
         min_len = min(len(direct_res["token_ids"]), len(merkle_res["token_ids"]))
         matching_tokens = sum(
@@ -299,6 +326,22 @@ class SideBySideComparator:
 
     def close(self):
         self.merkle_engine.close()
+
+
+def print_available_tools():
+    print("\n┌────────────────────────────────────────────────────────────────────────────┐")
+    print("│ SYNAPCORE REGISTERED TOOLS (<tool_call> Live Sandbox + Open-Meteo API)    │")
+    print("└────────────────────────────────────────────────────────────────────────────┘")
+    for t in SYNAPCORE_TOOLS_SCHEMA:
+        fn = t["function"]
+        print(f"  • {fn['name']:<24} : {fn['description']}")
+    print("\n  Example Prompts to Try Directly in Chat:")
+    print("    - current temprature in chandigarh? sirf temprature batao, in short")
+    print("    - What is the weather in Tokyo?")
+    print("    - Calculate 1542 * 89 + 312")
+    print("    - What is the stock price of NVDA?")
+    print("    - Convert 100 USD to INR")
+    print("    - what is ur name?\n")
 
 
 def main():
@@ -354,7 +397,8 @@ def main():
             comparator.run_turn(args.prompt, max_new_tokens=args.max_tokens)
             return
 
-        print("Interactive Dual-Chat Mode Started! Type your message below (or 'exit' / 'quit' to stop).")
+        print_available_tools()
+        print("Interactive Dual-Chat Mode Started! Type '/tools' to list available tools, or 'exit' / 'quit' to stop.")
         while True:
             try:
                 user_msg = input("You > ").strip()
@@ -366,6 +410,9 @@ def main():
             if user_msg.lower() in {"exit", "quit", ":q"}:
                 print("Exiting chat.")
                 break
+            if user_msg.lower() == "/tools":
+                print_available_tools()
+                continue
             comparator.run_turn(user_msg, max_new_tokens=args.max_tokens)
     finally:
         comparator.close()

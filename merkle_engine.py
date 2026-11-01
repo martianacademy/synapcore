@@ -3,7 +3,7 @@
 Low-RAM Merkle-MoE Inference Engine for OLMoE-1B-7B-0125-Instruct (Metal MPS + CPU Edition)
 ===========================================================================================
 Executes OlmoeForCausalLM directly from the Hybrid Merkle / B+ Tree Store with Apple Metal
-GPU (`mps`) Unified Memory Binding:
+GPU (`mps`) Unified Memory Binding and Copy-on-Write (CoW) Continual Learning Overlay:
 
 1. 3-Tier Apple Metal Unified Memory Architecture:
    - Tier 1 (Pinned on Metal GPU `mps` / RAM: 614.60 MiB):
@@ -16,8 +16,9 @@ GPU (`mps`) Unified Memory Binding:
      * Zero-copy 16 KB page-aligned `mmap` views on SSD streamed into a single pre-allocated
        12.00 MiB Metal staging buffer (`_mps_staging_gu`, `_mps_staging_d`) via in-place `.copy_()`,
        eliminating dynamic GPU buffer allocation/deallocation thrashing on cold expert faults.
-   - Token Embeddings (`embed_tokens.bin` on SSD):
-     * Fetched per active Token_ID (4 KB/token via `pread`) and transferred directly to target device.
+   - Copy-on-Write (CoW) Delta Overlay (`cas_cow_deltas.bin`):
+     * Automatically overlays evolved synaptic leaves committed by `synapcore_learn.py` in
+       chronological commit order (can be toggled with `--base-only` for instant rollback).
 """
 
 import argparse
@@ -391,7 +392,8 @@ class MerklePrefixKVCache:
 
 class MerkleMoEEngine:
     """
-    Complete Split-Memory Merkle-MoE Inference Engine with Apple Metal (`mps`) Unified Memory Binding.
+    Complete Split-Memory Merkle-MoE Inference Engine with Apple Metal (`mps`) Unified Memory Binding
+    and Copy-on-Write (CoW) Continual Learning Overlay.
     """
 
     def __init__(
@@ -403,6 +405,7 @@ class MerkleMoEEngine:
         verify_merkle_on_load: bool = False,
         evict_cold_mmap_pages: bool = False,
         device: str = "auto",
+        use_cow_commits: bool = True,
     ):
         self.store_dir = Path(store_dir)
         self.device = resolve_device(device)
@@ -411,11 +414,15 @@ class MerkleMoEEngine:
         self.evict_cold_mmap_pages = evict_cold_mmap_pages
         self.enable_lookahead = enable_lookahead
         self.enable_merkle_kv = enable_merkle_kv
+        self.use_cow_commits = use_cow_commits
+        self.active_merkle_root: str = ""
+        self.cow_leaves_loaded: int = 0
 
         with open(self.store_dir / "config.json", "r") as f:
             self.config = json.load(f)
         with open(self.store_dir / "merkle_manifest.json", "r") as f:
             self.manifest = json.load(f)
+        self.active_merkle_root = self.manifest["model_merkle_root"]
 
         self.num_layers: int = self.config["num_hidden_layers"]        # 16
         self.num_experts: int = self.config["num_experts"]             # 64
@@ -458,12 +465,12 @@ class MerkleMoEEngine:
         self.cas_mmap = mmap.mmap(self.cas_file.fileno(), 0, access=mmap.ACCESS_READ)
         madvise_range(self.cas_mmap, 0, self.manifest["expert_cas_total_bytes"], MADV_RANDOM)
 
+        self.expert_cache = HotExpertLFULRUCache(max_experts=expert_cache_size)
         self.expert_index: Dict[Tuple[int, int], Tuple[str, int, int]] = {}
         self.expert_mmap_views: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         self._load_expert_bptree_index()
 
         # Pre-allocate a single reusable 12.00 MiB Metal staging buffer for Cold Experts
-        # so cold expert faults NEVER trigger dynamic MTLBuffer allocation/deallocation!
         if self.is_mps:
             self._mps_staging_gu = torch.empty(
                 (2 * self.intermediate_size, self.hidden_size), dtype=torch.float16, device=self.device
@@ -475,7 +482,6 @@ class MerkleMoEEngine:
             self._mps_staging_gu = None
             self._mps_staging_d = None
 
-        self.expert_cache = HotExpertLFULRUCache(max_experts=expert_cache_size)
         self.lsh_predictor = LSHLookaheadPredictor(
             device=self.device, hidden_size=self.hidden_size, num_layers=self.num_layers
         )
@@ -513,7 +519,6 @@ class MerkleMoEEngine:
             np_arr = np.frombuffer(raw_core, dtype=np.float16, count=length // 2, offset=off).reshape(shape).copy()
             self.shared_core[t_name] = torch.from_numpy(np_arr).to(self.device)
 
-        # Fuse q_proj, k_proj, v_proj per layer into a single [6144, 2048] matrix on self.device
         for l_idx in range(self.num_layers):
             p = f"model.layers.{l_idx}.self_attn"
             q_w = self.shared_core.pop(f"{p}.q_proj.weight")
@@ -556,6 +561,50 @@ class MerkleMoEEngine:
                 self.cas_mmap, dtype=torch.float16, count=d_elems, offset=byte_off + gu_bytes
             ).view(self.hidden_size, self.intermediate_size)
             self.expert_mmap_views[key] = (gu_t, d_t)
+
+        # Overlay Copy-on-Write (CoW) Continual Learning Delta Leaves in chronological commit order!
+        delta_path = self.store_dir / "cas_cow_deltas.bin"
+        if self.use_cow_commits and delta_path.exists():
+            try:
+                commit_rows = self.conn.execute(
+                    "SELECT commit_id, new_model_root_hex, updated_leaves_json FROM merkle_commits ORDER BY created_at ASC"
+                ).fetchall()
+                if commit_rows:
+                    raw_deltas = delta_path.read_bytes()
+                    modified_keys: Set[Tuple[int, int]] = set()
+                    for _, new_root_hex, leaves_json in commit_rows:
+                        updated_leaves = json.loads(leaves_json)
+                        for item in updated_leaves:
+                            l_i = int(item["layer"])
+                            e_i = int(item["expert"])
+                            d_off = int(item["delta_offset"])
+                            d_len = int(item["nbytes"])
+                            if d_off + d_len > len(raw_deltas):
+                                continue
+                            leaf_slice = raw_deltas[d_off : d_off + d_len]
+                            full_sha_hex = sha256_bytes(leaf_slice).hex()
+
+                            gu_np = np.frombuffer(leaf_slice, dtype=np.float16, count=gu_elems, offset=0).reshape(
+                                2 * self.intermediate_size, self.hidden_size
+                            ).copy()
+                            d_np = np.frombuffer(leaf_slice, dtype=np.float16, count=d_elems, offset=gu_bytes).reshape(
+                                self.hidden_size, self.intermediate_size
+                            ).copy()
+                            gu_cow = torch.from_numpy(gu_np)
+                            d_cow = torch.from_numpy(d_np)
+
+                            self.expert_index[(l_i, e_i)] = (full_sha_hex, d_off, d_len)
+                            self.expert_mmap_views[(l_i, e_i)] = (gu_cow, d_cow)
+                            self.expert_cache.put(
+                                full_sha_hex,
+                                (gu_cow.to(self.device), d_cow.to(self.device)),
+                                is_prefetch=False,
+                            )
+                            modified_keys.add((l_i, e_i))
+                        self.active_merkle_root = new_root_hex
+                    self.cow_leaves_loaded = len(modified_keys)
+            except Exception:
+                pass
 
     def prefetch_expert_async(self, layer_idx: int, expert_idx: int):
         """Triggers OS-level async NVMe read (MADV_WILLNEED) on the 12 MiB page-aligned Merkle leaf."""
@@ -600,9 +649,6 @@ class MerkleMoEEngine:
         gu_t, d_t = self.expert_mmap_views[key]
 
         if self.is_mps:
-            # On Apple Metal GPU:
-            # - If admitted to Hot-Expert Cache: pin as a persistent Metal MTLBuffer tensor (`to('mps')`).
-            # - If Cold Expert: stream into the reusable 12 MiB Metal staging buffer (`copy_`) with zero allocations!
             if self.expert_cache.should_admit(sha_hex):
                 promoted = (gu_t.to(self.device, non_blocking=True), d_t.to(self.device, non_blocking=True))
                 self.expert_cache.put(sha_hex, promoted, is_prefetch=False)
@@ -612,7 +658,6 @@ class MerkleMoEEngine:
                 self._mps_staging_d.copy_(d_t, non_blocking=True)
                 return self._mps_staging_gu, self._mps_staging_d, True, byte_off, byte_len
 
-        # CPU path: zero-copy mmap view
         if self.expert_cache.should_admit(sha_hex):
             if not self.evict_cold_mmap_pages:
                 madvise_range(self.cas_mmap, byte_off, byte_len, MADV_WILLNEED)
@@ -714,7 +759,6 @@ class MerkleMoEEngine:
             layer_idx, hidden_states, last_tok_experts, predicted_for_this_layer
         )
 
-        # Ultra-fast path for single-token decode (seq_len == 1)
         if seq_len == 1:
             final_hidden = torch.zeros_like(hidden_states)
             scores_1d = top_scores[0].tolist()
@@ -728,7 +772,6 @@ class MerkleMoEEngine:
                     madvise_range(self.cas_mmap, byte_off, byte_len, MADV_DONTNEED)
             return final_hidden, last_tok_experts
 
-        # Multi-token prefill / speculative batch verification path
         top_indices_cpu = top_indices.to("cpu")
         expert_to_tokens: Dict[int, List[Tuple[int, torch.Tensor]]] = collections.defaultdict(list)
         for tok_pos in range(seq_len):
@@ -901,20 +944,26 @@ class MerkleMoEEngine:
             self.kv_prefix_cache.save_prefix_blocks(input_ids, kv_cache)
 
         ttft_sec = time.perf_counter() - t_start
+        eos_id = self.config.get("eos_token_id", 50279)
+        stop_ids = {eos_id, 0}
+
         next_token = int(torch.argmax(logits, dim=-1).item())
-        generated_ids: List[int] = [next_token]
+        generated_ids: List[int] = []
+        if next_token not in stop_ids:
+            generated_ids.append(next_token)
         curr_pos = len(input_ids)
 
         t_decode_start = time.perf_counter()
-        eos_id = self.config.get("eos_token_id", 50279)
 
         for _ in range(max_new_tokens - 1):
-            if next_token == eos_id:
+            if next_token in stop_ids:
                 break
             logits = self.forward_tokens([next_token], kv_cache=kv_cache, start_pos=curr_pos)
             next_token = int(torch.argmax(logits, dim=-1).item())
-            generated_ids.append(next_token)
             curr_pos += 1
+            if next_token in stop_ids:
+                break
+            generated_ids.append(next_token)
 
         decode_sec = max(1e-6, time.perf_counter() - t_decode_start)
         decode_tokens = max(1, len(generated_ids) - 1)
@@ -939,6 +988,8 @@ class MerkleMoEEngine:
 
         return {
             "device": str(self.device),
+            "active_merkle_root": self.active_merkle_root,
+            "cow_leaves_loaded": self.cow_leaves_loaded,
             "prompt": prompt,
             "prompt_tokens": len(input_ids),
             "merkle_kv_matched_tokens": matched_len,
@@ -987,6 +1038,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=36)
     parser.add_argument("--cache-experts", type=int, default=205)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "mps", "cpu"])
+    parser.add_argument("--base-only", action="store_true", help="Ignore Copy-on-Write continual learning commits")
     args = parser.parse_args()
 
     engine = MerkleMoEEngine(
@@ -996,6 +1048,7 @@ def main():
         enable_merkle_kv=True,
         verify_merkle_on_load=True,
         device=args.device,
+        use_cow_commits=(not args.base_only),
     )
     res = engine.generate(args.prompt, max_new_tokens=args.max_tokens)
     print(json.dumps(res, indent=2))

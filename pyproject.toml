@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synapcore"
+version = "0.1.0"
+description = "SynapCore: Low-RAM Mixture-of-Experts (MoE) Inference Engine via Content-Addressable Merkle / B+ Tree Storage"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "SynapCore Contributors" }
+]
+keywords = [
+    "moe",
+    "mixture-of-experts",
+    "merkle-tree",
+    "low-ram",
+    "inference-engine",
+    "olmoe",
+    "apple-silicon",
+    "mps",
+    "content-addressable-storage"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.2.0",
+    "numpy>=1.24.0",
+    "safetensors>=0.4.0",
+    "tokenizers>=0.19.0",
+    "transformers>=4.45.0",
+]
+
+[project.scripts]
+synapcore-convert = "merkle_store:main"
+synapcore-run = "merkle_engine:main"
+synapcore-chat = "compare_chat:main"
+synapcore-bench = "benchmark_merkle_moe:run_full_benchmark"
+
+[tool.setuptools]
+py-modules = ["merkle_store", "merkle_engine", "compare_chat", "benchmark_merkle_moe"]

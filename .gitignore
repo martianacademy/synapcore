@@ -1,0 +1,13 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+
+# Heavy binary model weights & runtime KV cache blocks (keep merkle_manifest.json tracked!)
+olmoe_merkle_store/*.bin
+olmoe_merkle_store/*.db
+olmoe_merkle_store/*.db-shm
+olmoe_merkle_store/*.db-wal
+olmoe_merkle_store/kv_cache_blocks/
+olmoe_merkle_store/tokenizer.json

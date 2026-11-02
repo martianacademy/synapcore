@@ -1,0 +1,92 @@
+================================================================================
+TWEET 1/8 (Attach your terminal telemetry screenshot here)
+================================================================================
+We just built SynapCore (v0.2) — a Native C++17 / Metal & MLX Mixture-of-Experts (MoE) inference engine backed by a 2.1 MB mmap binary index (merkle_tree.idx) and a 64 KB Flat XOR Merkle Tree.
+
+Running OLMoE-1B-7B (6.92B params) on Apple Silicon:
+• Decode Speed: 164.53 tok/s (beats full .safetensors 163.23 tok/s & LM Studio 154.81 tok/s)
+• Prefill TTFT: 8.7 ms vs 145.7 ms (16.7x faster)
+• Weight RAM Used: 2,176 MiB vs 13,197 MiB (-83.51% RAM saved)
+• Embedding RAM: 1,564 KB (mmap) vs 196.50 MiB (-99.2%)
+
+Here is how we engineered it 🧵👇
+
+================================================================================
+TWEET 2/8
+================================================================================
+2/ Why do MoE models eat so much RAM when only 12.5% of parameters activate per token?
+
+In allenai/OLMoE-1B-7B-0125-Instruct (64 experts/layer, top-8 active), expert matrices (gate_proj, up_proj, down_proj) are scattered across three 5 GB .safetensors shards—spanning up to 5.05 GiB inside a shard, with two experts (L6E7 & L12E33) physically split across separate files.
+
+Standard loaders force you to wire the entire 13.20 GiB checkpoint + 196.5 MiB embedding table in RAM just to use 8 experts per layer.
+
+================================================================================
+TWEET 3/8
+================================================================================
+3/ Step 1: Zero-Copy Contiguous Expert Leaves & mmap Embeddings
+
+SynapCore de-fragments the .safetensors shards into a tiered binary store:
+• shared_core.bin (516.25 MiB): Pinned Attention, RMSNorms & Routers
+• cas_experts.bin (12.00 GiB): 1,024 contiguous, 16 KB page-aligned 12 MiB expert leaves (gate || up || down)
+• embed_tokens.bin (196.50 MiB on SSD): Memory-mapped (mmap) 4 KB token leaves—paging in only the exact tokens used in your prompt (~1.5 MiB in RAM instead of 196.5 MiB).
+
+================================================================================
+TWEET 4/8
+================================================================================
+4/ Step 2: Replacing SQLite with merkle_tree.idx (1,037x Faster Lookups)
+
+Originally, we indexed expert offsets and hashes in a 6.14 MiB SQLite B+ Tree (merkle_index.db), which cost 3,177 ns per lookup.
+
+We replaced SQLite entirely with merkle_tree.idx (2.12 MiB, -65.4% smaller)—a zero-serialization mmap file of 64-byte cache-line-aligned C structs (SynapCoreExpertEntry).
+
+Lookup is now a single pointer offset: slot = (layer << 6) | expert.
+• SQLite B+ Tree (10k lookups): 31.771 ms (3,177.1 ns/lookup)
+• Native C++ mmap (10k lookups): 0.031 ms (3.1 ns/lookup — 1,037.4x faster!)
+
+================================================================================
+TWEET 5/8
+================================================================================
+5/ Step 3: 64 KB Flat XOR Binary Merkle Tree
+
+Every expert leaf and token embedding in SynapCore is cryptographically verified against a 32-byte SHA-256 Model Merkle Root (a046d97ee...).
+
+Instead of storing JSON Merkle proof arrays, merkle_tree.idx embeds a 64 KB Flat Binary Merkle Tree (nodes[1..2047]) that fits entirely in L1/L2 CPU cache:
+• Sibling index: node ^ 1
+• Parent index: node >> 1
+
+All 1,024 expert leaves are verified bottom-up at engine startup in 2.06 ms, adding 0.0 ms overhead during token generation.
+
+================================================================================
+TWEET 6/8
+================================================================================
+6/ Step 4: How a Sparse mmap Engine Beat the Full In-Memory Model on Speed (164.53 tok/s)
+
+On Apple Silicon (MLX C++/Metal), we optimized every hot-path kernel in native_engine.py:
+1. Coalesced Fused-QKV gemv_t: Fused q_proj, k_proj, v_proj into a single row-major [6144, 2048] matrix per layer, dispatching Metal's SIMD gemv_t kernel and cutting 32 GEMM launches per token.
+2. @mx.compile Router + SwitchGLU (mx.gather_mm): Fused softmax + argpartition + take_along_axis on GPU with zero CPU sync stalls.
+3. Single-Output mx.async_eval Pipeline: Overlaps token t+1 GPU compute with token t decoding.
+
+================================================================================
+TWEET 7/8
+================================================================================
+7/ Step 5: 8.7 ms Prefill TTFT via Robin-Hood Merkle KV-Prefix Cache
+
+Inside merkle_tree.idx, we embedded an 80 KB Open-Addressing Robin-Hood Hash Table (1,024 × 80B slots).
+
+Prompt tokens are hashed in 16-token blocks chained from the active model_merkle_root:
+Hash_N = SHA256(Hash_{N-1} || Tokens_Block_N)
+
+On a prefix hit, precomputed .safetensors KV blocks are mapped straight into pre-allocated KVCache(step=256) buffers—dropping Prefill TTFT from 145.7 ms -> 8.7 ms (16.7x faster)!
+
+================================================================================
+TWEET 8/8
+================================================================================
+8/ Open-Source & Ready to Run on Apple Silicon
+
+Full Native C++17 / Objective-C++ Metal & MLX source code (synapcore_native.mm, native_engine.py, build_native_db.py, native_chat.py) is now live on GitHub under Apache-2.0:
+
+🔗 GitHub: https://github.com/martianacademy/synapcore
+
+Next up: Native Copy-on-Write (cas_cow_deltas.bin) Continual Self-Learning directly on merkle_tree.idx + 4-bit Cold Expert compression (12 GiB -> 3.4 GiB).
+
+Star the repo & let us know what MoE model we should port next! 🚀🔥

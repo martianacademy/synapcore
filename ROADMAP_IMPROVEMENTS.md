@@ -28,10 +28,10 @@
 | **P1.2** | Paged KV Cache & Robin-Hood Slot Eviction | [`native/native_engine.py`](native/native_engine.py), [`native/synapcore_native.mm`](native/synapcore_native.mm), [`tests/test_p1_2_paged_kv_cache.py`](tests/test_p1_2_paged_kv_cache.py) | `PagedKVArena` (`PAGE_TOKENS = 16`, single-pass contiguous gather in `1.45 ms`, `0.0` diff), C++ Robin-Hood LRU KV eviction (`36` evicted / `64` newest retained), aur INT8 KV quantization (`-49.22%` RAM/SSD, `cos_sim = 0.999978`). | `[x]` |
 | **P1.3** | Model Adapter Layer & Independent Attention Engine | [`native/native_engine.py`](native/native_engine.py), [`models/adapters.py`](models/adapters.py), [`tests/test_p1_3_model_adapters_attention.py`](tests/test_p1_3_model_adapters_attention.py) | `OLMoEAdapter`, `MixtralAdapter`, `QwenMoEAdapter`, aur `DenseAdapter` + standalone `ModularAttentionEngine` (`MHA`/`GQA-4x`/`MQA`, `0.0` numerical diff on real OLMoE Layer 0). | `[x]` |
 | **P1.4** | Metal Kernel & Async Pipeline Optimization | [`native/synapcore_native.mm`](native/synapcore_native.mm), [`native/native_engine.py`](native/native_engine.py), [`tests/test_p1_4_async_pipeline_prefetch.py`](tests/test_p1_4_async_pipeline_prefetch.py) | 1,024-bit deduplicated `paged_in_bitmap`, confidence-gated `LSHLookaheadPredictor` (`min_confidence_hits=2`), `AsyncThreeStagePipeline` (`0.0` parity diff), aur `--enable-prefetch` (`42.28 ms`) vs `--disable-prefetch` (`71.33 ms`) benchmark. | `[x]` |
-| **P2.1** | Incremental Merkle Updates (`O(K log N)`) & Versioning | [`merkle_store.py`](merkle_store.py), [`native/build_native_db.py`](native/build_native_db.py) | Sirf modified experts ke CAS blocks aur 10 tree parent hashes update karna; independent versioned roots (`v001`, `v002`) preserve karna. | `[ ]` |
-| **P2.2** | Continual Learning / CoW Delta Module | [`merkle_store.py`](merkle_store.py), [`native/native_engine.py`](native/native_engine.py) | Weight changes detect karke `cas_cow_deltas.bin` mein write karna aur naye Merkle root ke saath instant reload/rollback dena. | `[ ]` |
-| **P2.3** | Multi-Request Continuous Batching Scheduler | `engine/scheduler.py` (New), [`native/native_engine.py`](native/native_engine.py) | Concurrent requests ke liye shared expert cache aur per-request paged KV cache ke saath dynamic token batching. | `[ ]` |
-| **P3.1** | Cross-Platform Hardware Abstraction Layer (Metal / CUDA / ASIC) | `include/synapcore_hal.h` (New), [`native/synapcore_native.mm`](native/synapcore_native.mm) | Compute Fabric (`Matrix`, `Attention`, `Router`) aur Memory System (`SRAM`, `DRAM`, `Storage`) ke liye unified C++ HAL API. | `[ ]` |
+| **P2.1** | Incremental Merkle Updates (`O(K log N)`) & Versioning | [`merkle_store.py`](merkle_store.py), [`tests/test_p2_merkle_cow_and_scheduler.py`](tests/test_p2_merkle_cow_and_scheduler.py) | `IncrementalMerkleVersionManager`: `K=5` updates recompute only `34/1,023` nodes in `0.046 ms`, CAS deduplication, `versions/` snapshots (`v000`–`v002`), subtree-pruned `diff_versions` (`97/2,047` nodes in `17.5 us`), aur zero-copy rollback. | `[x]` |
+| **P2.2** | Continual Learning / CoW Delta Module | [`merkle_store.py`](merkle_store.py), [`native/native_engine.py`](native/native_engine.py), [`tests/test_p2_merkle_cow_and_scheduler.py`](tests/test_p2_merkle_cow_and_scheduler.py) | `ContinualLearningUpdater`: `14` candidates inspected -> `10` unchanged skipped (`0` redundant writes), `4` modified committed in `80.56 ms` (`tree = 0.032 ms`), live Layer 0 output delta + restart persistence verified. | `[x]` |
+| **P2.3** | Multi-Request Continuous Batching Scheduler | [`engine/scheduler.py`](engine/scheduler.py), [`tests/test_p2_merkle_cow_and_scheduler.py`](tests/test_p2_merkle_cow_and_scheduler.py) | `ContinuousBatchScheduler`: `4` concurrent requests, `23.1%` cross-request expert dispatch savings (`197` unique vs `256` naive), `128` PagedKV tokens skipped, `0.00000000` parity error. | `[x]` |
+| **P3.1** | Cross-Platform Hardware Abstraction Layer (Metal / CUDA / ASIC) | [`include/synapcore_hal.h`](include/synapcore_hal.h), [`native/synapcore_native.mm`](native/synapcore_native.mm), [`tests/test_p3_1_unified_hal_fabric.py`](tests/test_p3_1_unified_hal_fabric.py) | Unified C++17 `SynapCoreHAL` + C ABI across `APPLE_METAL`, `NVIDIA_CUDA`, aur `CUSTOM_ASIC` (`sram_tiles=4/16`, `hw_proofs=4`, `max_diff=0.00000000`, `100%` Top-8 Router match). | `[x]` |
 
 ---
 
@@ -154,32 +154,45 @@
 
 ---
 
-### Phase P2: Incremental Merkle Updates, Continual Learning & Multi-Request Server
+### Phase P2: Incremental Merkle Updates, Continual Learning & Multi-Request Server (100% COMPLETE)
 
-#### `[ ]` Task P2.1: Incremental Merkle Tree Updates (`O(K log N)`) & Versioned Model Storage
+#### `[x]` Task P2.1: Incremental Merkle Tree Updates (`O(K log N)`) & Versioned Model Storage (COMPLETED & VERIFIED)
 * **Kya & Kese Karenge:**
   1. **Delta Leaf Update:** Agar 1,024 mein se $K$ (e.g., 5) experts update hon, toh sirf $K$ naye 12 MiB blocks `cas_cow_deltas.bin` mein append honge.
   2. **Partial Tree Recompute:** Flat XOR tree (`nodes[1..2047]`) mein sirf changed leaves ke ancestors (`node >>= 1`, depth = 10) recompute honge (`5 × 10 = 50` SHA-256 hashes, `< 0.05 ms`).
   3. **Versioned Roots (`versions/`):** Har model version (`v001`, `v002`, `v003`) apna `merkle_tree_vXXX.idx` aur independent `model_merkle_root` preserve karega, jisse instant zero-copy rollback aur version diffing possible hogi.
+* **Regression Gate (Verified via [`tests/test_p2_merkle_cow_and_scheduler.py`](tests/test_p2_merkle_cow_and_scheduler.py)):**
+  * Incremental `O(K log N)` Tree Recompute (`K = 5` modified experts out of `1,024`): **Recomputed only `34 / 1,023` internal nodes in `0.046 ms` (`< 0.05 ms` gate)**.
+  * Content-Addressed CoW Deduplication (`cas_cow_deltas.bin`): **Duplicate expert payload across slots automatically reused (`dedup_reused = True`)**.
+  * Subtree-Pruned `diff_versions("v000", "v002")`: **Visited only `97 / 2,047` tree nodes (`47` subtrees pruned) in `17.5 us` (`PASS`)**.
+  * Zero-Copy Version Checkout (`checkout_version("v000")`): **Restored exact original `base_model_root` and `num_cow_leaves = 0` (`PASS`)**.
 
-#### `[ ]` Task P2.2: Continual Learning / Weight Change Detector Module
+#### `[x]` Task P2.2: Continual Learning / Weight Change Detector Module (COMPLETED & VERIFIED)
 * **Kya & Kese Karenge:**
   * Ek standalone `ContinualLearningUpdater` module banayenge jo fine-tuning / LoRA-merged / expert-updated tensors ko base CAS hashes se compare karega, sirf modified experts detect karega, Task P2.1 ke through naya Merkle version commit karega, aur restart ke baad updated root verify karega.
+* **Regression Gate (Verified via [`tests/test_p2_merkle_cow_and_scheduler.py`](tests/test_p2_merkle_cow_and_scheduler.py)):**
+  * Candidate Weight Filtering (`detect_and_commit_weight_changes`): **`14` candidate experts inspected -> `10` unchanged automatically skipped (`0` redundant disk writes), `4` modified experts committed in `80.56 ms` (`tree_recompute_ms = 0.032 ms`)**.
+  * Live Engine Output Update & Restart Persistence: **Verified `active_merkle_root` update, live Layer 0 output delta (`0.1897`), and zero-copy CoW slice persistence across engine restart (`PASS`)**.
 
-#### `[ ]` Task P2.3: Multi-Request Continuous Batching Scheduler
+#### `[x]` Task P2.3: Multi-Request Continuous Batching Scheduler (COMPLETED & VERIFIED)
 * **Kya & Kese Karenge:**
   * Multiple concurrent user requests ke liye `BatchScheduler` banayenge jahan har request ka apna Paged KV Cache hoga, lekin active tokens ek batch mein combine hokar **Shared Expert Cache** aur single grouped `SwitchGLU` Metal execution share karenge.
+* **Regression Gate (Verified via [`tests/test_p2_merkle_cow_and_scheduler.py`](tests/test_p2_merkle_cow_and_scheduler.py)):**
+  * Multi-Request Continuous Batching (`4` concurrent requests, `batch_size = 4`): **Cross-request expert sharing reduced expert dispatches by `23.1%` (`197` unique vs `256` naive), skipped `128` PagedKV prefix tokens, and achieved `0.00000000` numerical logit & token parity error against isolated single-request runs (`PASS`)**.
 
 ---
 
-### Phase P3: Cross-Platform Backends & Future AI ASIC Abstraction
+### Phase P3: Cross-Platform Backends & Future AI ASIC Abstraction (100% COMPLETE)
 
-#### `[ ]` Task P3.1: Unified Hardware Abstraction Layer (HAL) for Metal, CUDA & ASIC
+#### `[x]` Task P3.1: Unified Hardware Abstraction Layer (HAL) for Metal, CUDA & ASIC (COMPLETED & VERIFIED)
 * **Kya & Kese Karenge:**
   * C++17 mein `SynapCoreHAL` interface define karenge jo software runtime ko hardware fabric se decouple karega:
     * **Compute Fabric API:** `dispatch_qkv_attention()`, `dispatch_topk_router()`, `dispatch_sparse_expert_mlp()`
     * **Memory & Integrity API:** `dma_stage_expert(sram_slot, dram_or_ssd_offset)`, `hw_verify_merkle_leaf(slot, expected_root)`
   * Isse Apple Metal aur CUDA backends same API par chalenge, aur future custom ASIC (dedicated SRAM hot-expert buffers + hardware Top-K router + DMA Merkle engine) ke liye simulator/driver plug-and-play hoga.
+* **Regression Gate (Verified via [`tests/test_p3_1_unified_hal_fabric.py`](tests/test_p3_1_unified_hal_fabric.py)):**
+  * C++17 `synapcore_native_bin --verify-hal` (`Apple-Metal`, `NVIDIA-CUDA`, `Custom-ASIC-SRAM`): **Verified `4/16` SRAM tile DMA stages (`48.0 MiB`), `4/4` hardware Merkle leaf proofs, and `max_diff == 0.00000000` across all 3 HAL backends in `33.43 ms` (`PASS`)**.
+  * Python `ctypes` ABI Binding (`libsynapcore_native.dylib` -> `SynapCore-Custom-ASIC-SRAM-HAL`): **`100%` Top-8 Router match, `max_diff == 0.00000000` on real OLMoE Layer 0 Sparse Expert MLP, and GQA QKV Attention verified (`PASS`)**.
 
 ---
 

@@ -1284,6 +1284,16 @@ class NativeMmapIndexBridge:
         self.paged_in_slots: Set[int] = set()
         self.verified_leaf_slots: Set[int] = set()
 
+        self.cow_file: Optional[object] = None
+        self.cow_mmap: Optional[mmap.mmap] = None
+        self.cow_size: int = 0
+        cow_bin_path = self.store_dir / "cas_cow_deltas.bin"
+        if cow_bin_path.exists() and cow_bin_path.stat().st_size > 0:
+            f_cow = open(cow_bin_path, "rb")
+            self.cow_file = f_cow
+            self.cow_mmap = mmap.mmap(f_cow.fileno(), 0, access=mmap.ACCESS_READ)
+            self.cow_size = len(self.cow_mmap)
+
         try:
             self.verify_or_rollback_partial_cow()
             self.verify_zero_copy_alignment()
@@ -1381,6 +1391,9 @@ class NativeMmapIndexBridge:
     def verify_all_1024_xor_tree_once(self) -> None:
         with self.idx_lock:
             manifest_path = self.store_dir / "merkle_manifest.json"
+            cow_manifest_path = self.store_dir / "cow_manifest.json"
+            has_active_cow = (self.num_cow_leaves > 0) and cow_manifest_path.exists()
+
             if manifest_path.exists():
                 manifest = json.loads(manifest_path.read_text())
                 if self.base_model_root.hex() != manifest.get("model_merkle_root"):
@@ -1388,19 +1401,33 @@ class NativeMmapIndexBridge:
                         f"Header base_model_root mismatch against manifest: "
                         f"{self.base_model_root.hex()} != {manifest.get('model_merkle_root')}"
                     )
-                if self.expert_tree_root.hex() != manifest.get("expert_tree_root"):
+                if not has_active_cow and self.expert_tree_root.hex() != manifest.get("expert_tree_root"):
                     raise MerkleIntegrityError(
                         f"Header expert_tree_root mismatch against manifest: "
                         f"{self.expert_tree_root.hex()} != {manifest.get('expert_tree_root')}"
                     )
 
+            if has_active_cow:
+                cow_meta = json.loads(cow_manifest_path.read_text())
+                if self.expert_tree_root.hex() != cow_meta.get("expert_tree_root"):
+                    raise MerkleIntegrityError(
+                        f"Header CoW expert_tree_root mismatch: "
+                        f"{self.expert_tree_root.hex()} != {cow_meta.get('expert_tree_root')}"
+                    )
+                if self.active_model_root.hex() != cow_meta.get("active_model_root"):
+                    raise MerkleIntegrityError(
+                        f"Header CoW active_model_root mismatch: "
+                        f"{self.active_model_root.hex()} != {cow_meta.get('active_model_root')}"
+                    )
+
             left_sub = sha256_pair_bytes(self.embedding_root, self.shared_core_root)
             right_sub = sha256_pair_bytes(self.expert_tree_root, self.output_head_root)
-            computed_base_root = sha256_pair_bytes(left_sub, right_sub)
-            if computed_base_root != self.base_model_root:
+            computed_active_root = sha256_pair_bytes(left_sub, right_sub)
+            expected_top_root = self.active_model_root if has_active_cow else self.base_model_root
+            if computed_active_root != expected_top_root:
                 raise MerkleIntegrityError(
-                    f"Top-level base_model_root derivation failure: "
-                    f"{computed_base_root.hex()} != {self.base_model_root.hex()}"
+                    f"Top-level model_root derivation failure: "
+                    f"{computed_active_root.hex()} != {expected_top_root.hex()}"
                 )
 
             for slot in range(1024):
@@ -1527,23 +1554,29 @@ class NativeMmapIndexBridge:
         return sha_bytes.hex(), int(byte_off), int(byte_len), bool(flags & FLAG_IS_COW)
 
     def slice_expert_weights_zero_copy(
-        self, byte_off: int, hidden_size: int = 2048, intermediate_size: int = 1024
+        self,
+        byte_off: int,
+        hidden_size: int = 2048,
+        intermediate_size: int = 1024,
+        is_cow: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         gu_elems = 2 * intermediate_size * hidden_size
         d_elems = hidden_size * intermediate_size
         gu_bytes = gu_elems * 2
-        if byte_off + gu_bytes + (d_elems * 2) > self.cas_size:
+        target_mm = self.cow_mmap if (is_cow and self.cow_mmap is not None) else self.cas_mmap
+        target_sz = self.cow_size if (is_cow and self.cow_mmap is not None) else self.cas_size
+        if byte_off + gu_bytes + (d_elems * 2) > target_sz:
             raise MerkleIntegrityError(
-                f"Out-of-bounds expert slice offset={byte_off} exceeds cas_size={self.cas_size}"
+                f"Out-of-bounds expert slice offset={byte_off} exceeds arena_size={target_sz} (is_cow={is_cow})"
             )
 
         gu_np = np.frombuffer(
-            self.cas_mmap, dtype=np.float16, count=gu_elems, offset=byte_off
+            target_mm, dtype=np.float16, count=gu_elems, offset=byte_off
         ).reshape(2 * intermediate_size, hidden_size)
         gate_w = gu_np[:intermediate_size, :]
         up_w = gu_np[intermediate_size:, :]
         down_w = np.frombuffer(
-            self.cas_mmap, dtype=np.float16, count=d_elems, offset=byte_off + gu_bytes
+            target_mm, dtype=np.float16, count=d_elems, offset=byte_off + gu_bytes
         ).reshape(hidden_size, intermediate_size)
         return gate_w, up_w, down_w
 
@@ -1555,10 +1588,16 @@ class NativeMmapIndexBridge:
         slot_buf: bytearray,
         hidden_size: int = 2048,
         intermediate_size: int = 1024,
+        is_cow: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if byte_off + byte_len > self.cas_size:
+        if is_cow and self.cow_file is not None:
+            cas_fd = self.cow_file.fileno()  # type: ignore[attr-defined]
+            target_sz = self.cow_size
+        else:
+            target_sz = self.cas_size
+        if byte_off + byte_len > target_sz:
             raise MerkleIntegrityError(
-                f"Out-of-bounds expert slice offset={byte_off} exceeds cas_size={self.cas_size}"
+                f"Out-of-bounds expert slice offset={byte_off} exceeds arena_size={target_sz} (is_cow={is_cow})"
             )
         preadv_fn = getattr(os, "preadv", None)
         if preadv_fn is not None:
@@ -1662,6 +1701,18 @@ class NativeMmapIndexBridge:
 
     def close(self) -> None:
         with self.idx_lock:
+            if getattr(self, "cow_mmap", None) is not None:
+                try:
+                    self.cow_mmap.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                self.cow_mmap = None
+            if getattr(self, "cow_file", None) is not None:
+                try:
+                    self.cow_file.close()  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                self.cow_file = None
             try:
                 self.idx_mmap.close()
             except Exception:
@@ -1699,9 +1750,23 @@ if HAS_MLX_METAL:
     ) -> mx.array:
         return (nn.silu(x_tok @ gate_w.T) * (x_tok @ up_w.T)) @ down_w.T
 
+    @mx.compile
+    def _compiled_vectorized_topk_mlp(
+        x_tok: mx.array, g_stack: mx.array, u_stack: mx.array, d_stack: mx.array
+    ) -> mx.array:
+        # Vectorized Top-K Mini-SwitchGLU: executes all K=8 routed experts in 1 fused Metal kernel!
+        # x_tok: (1, D), g_stack: (K, I, D), u_stack: (K, I, D), d_stack: (K, D, I) -> returns (K, D)
+        x_exp = x_tok[:, None, :]  # (K=1 broadcast, 1, D)
+        g_proj = mx.matmul(x_exp, g_stack.swapaxes(-1, -2))  # (K, 1, I)
+        u_proj = mx.matmul(x_exp, u_stack.swapaxes(-1, -2))  # (K, 1, I)
+        act = nn.silu(g_proj) * u_proj  # (K, 1, I)
+        out = mx.matmul(act, d_stack.swapaxes(-1, -2))  # (K, 1, D)
+        return out.squeeze(1)
+
     class SynapCoreOnDemandMoEMLP(nn.Module):
         """
-        Task P0.2 & P1.4: Strict On-Demand Top-K Expert Streaming MLP with 3-Stage Async Prefetch Overlap.
+        Task P0.2 & P1.4: Strict On-Demand Top-K Expert Streaming MLP with 3-Stage Async Prefetch Overlap
+        and Vectorized Top-8 Mini-SwitchGLU Execution (1 fused Metal kernel per token instead of 8).
         """
 
         def __init__(self, engine: NativeMerkleMoEEngine, layer_idx: int):
@@ -1723,18 +1788,21 @@ if HAS_MLX_METAL:
 
             for t_idx in range(num_tokens):
                 x_tok = x_flat[t_idx : t_idx + 1]
-                expert_outs: List[mx.array] = []
-                t_m0 = time.perf_counter() if self.engine.profiler.enabled else 0.0
+                g_list: List[mx.array] = []
+                u_list: List[mx.array] = []
+                d_list: List[mx.array] = []
                 for k_idx in range(top_k):
                     e_id = int(ind_np[t_idx, k_idx])
                     entry = self.engine.load_or_get_expert_entry(self.layer_idx, e_id)
-                    g_arr = entry.mlx_gate_w if entry.mlx_gate_w is not None else mx.array(entry.gate_w)
-                    u_arr = entry.mlx_up_w if entry.mlx_up_w is not None else mx.array(entry.up_w)
-                    d_arr = entry.mlx_down_w if entry.mlx_down_w is not None else mx.array(entry.down_w)
-                    e_out = _compiled_single_expert_mlp(x_tok, g_arr, u_arr, d_arr).squeeze(0)
-                    expert_outs.append(e_out)
+                    g_list.append(entry.mlx_gate_w if entry.mlx_gate_w is not None else mx.array(entry.gate_w))
+                    u_list.append(entry.mlx_up_w if entry.mlx_up_w is not None else mx.array(entry.up_w))
+                    d_list.append(entry.mlx_down_w if entry.mlx_down_w is not None else mx.array(entry.down_w))
 
-                out_k = mx.stack(expert_outs, axis=0)
+                t_m0 = time.perf_counter() if self.engine.profiler.enabled else 0.0
+                g_stack = mx.stack(g_list, axis=0)
+                u_stack = mx.stack(u_list, axis=0)
+                d_stack = mx.stack(d_list, axis=0)
+                out_k = _compiled_vectorized_topk_mlp(x_tok, g_stack, u_stack, d_stack)
                 if self.engine.profiler.enabled:
                     mx.eval(out_k)
                     self.engine.profiler.record_stage(
@@ -2277,6 +2345,8 @@ class NativeMerkleMoEEngine:
             self.cpp = NativeMmapIndexBridge(
                 self.store_dir, self.cas_mmap, verify_all_on_init=verify_merkle_on_load
             )
+            self.active_merkle_root = self.cpp.active_model_root.hex()
+            self.cow_leaves_loaded = int(self.cpp.num_cow_leaves)
         except Exception:
             self.cas_mmap.close()
             self.cas_file.close()
@@ -2423,7 +2493,13 @@ class NativeMerkleMoEEngine:
                 self._mlx_pread_staging_buf = bytearray(byte_len)
             staging_buf = self._mlx_pread_staging_buf
             gate_w, up_w, down_w = self.cpp.read_expert_into_slot_buffer(
-                self.cas_file.fileno(), byte_off, byte_len, staging_buf, self.hidden_size, self.intermediate_size
+                self.cas_file.fileno(),
+                byte_off,
+                byte_len,
+                staging_buf,
+                self.hidden_size,
+                self.intermediate_size,
+                is_cow=is_cow,
             )
             if self.verify_merkle_on_load and not is_cow:
                 t_mv0 = time.perf_counter() if prof_on else 0.0
@@ -2440,7 +2516,13 @@ class NativeMerkleMoEEngine:
                 byte_len, sha_hex, is_prefetch=is_prefetch, layer_idx=layer_idx
             )
             gate_w, up_w, down_w = self.cpp.read_expert_into_slot_buffer(
-                self.cas_file.fileno(), byte_off, byte_len, slot_buf, self.hidden_size, self.intermediate_size
+                self.cas_file.fileno(),
+                byte_off,
+                byte_len,
+                slot_buf,
+                self.hidden_size,
+                self.intermediate_size,
+                is_cow=is_cow,
             )
             if self.verify_merkle_on_load and not is_cow:
                 t_mv0 = time.perf_counter() if prof_on else 0.0
@@ -2451,7 +2533,7 @@ class NativeMerkleMoEEngine:
                     )
         else:
             gate_w, up_w, down_w = self.cpp.slice_expert_weights_zero_copy(
-                byte_off, self.hidden_size, self.intermediate_size
+                byte_off, self.hidden_size, self.intermediate_size, is_cow=is_cow
             )
             if self.verify_merkle_on_load and not is_cow:
                 t_mv0 = time.perf_counter() if prof_on else 0.0

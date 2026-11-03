@@ -16,7 +16,7 @@ Features:
        (`5.00 GiB`), releasing RAM/mmap pages and sleeping until the next calendar day!
   3. Resumable Multi-Dataset Cursor across Flagship Hugging Face Datasets:
      - `thinking`     : `open-thoughts/OpenThoughts3-1.2M`, `bespokelabs/Bespoke-Stratos-17k`, `ServiceNow-AI/R1-Distill-SFT`
-     - `tool_calling` : `Salesforce/xlam-function-calling-60k`, `hxssgaa/xlam-interleave-thinking-40k`, `NousResearch/hermes-function-calling-v1`
+     - `tool_calling` : `Jofthomas/hermes-function-calling-thinking-V1`, `NousResearch/hermes-function-calling-v1`, `Team-ACE/ToolACE`
      - `reasoning`    : `nvidia/OpenCodeReasoning`, `open-r1/OpenR1-Math-220k`, `open-thoughts/OpenThoughts-114k`
   4. In-Place Sub-Cluster SwiGLU Leaf + `(16, 256, 2048)` Router Fine-Tuning & Merkle Root Update:
      - Updates targeted 12 MiB expert leaves (`64..127` Thinking, `128..191` Tool-Calling, `192..255` Reasoning)
@@ -27,17 +27,19 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import fcntl
 import hashlib
 import json
 import os
 import signal
+import ssl
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Dict, List, Optional, Tuple, TypedDict
 
 import numpy as np
 
@@ -62,12 +64,13 @@ BYTES_PER_GIB: int = 1024**3
 BYTES_PER_MIB: int = 1024**2
 
 
-class HFSourceSpec(TypedDict):
+class HFSourceSpec(TypedDict, total=False):
     dataset: str
     config: str
     split: str
     domain: str
     parquet_API_url: str
+    fallback_configs: List[Tuple[str, str, str]]
 
 
 HF_DATASET_SOURCES: List[HFSourceSpec] = [
@@ -86,18 +89,27 @@ HF_DATASET_SOURCES: List[HFSourceSpec] = [
         "parquet_API_url": "https://huggingface.co/api/datasets/bespokelabs/Bespoke-Stratos-17k/parquet/default/train",
     },
     {
-        "dataset": "hxssgaa/xlam-interleave-thinking-40k",
+        "dataset": "Jofthomas/hermes-function-calling-thinking-V1",
         "config": "default",
         "split": "train",
         "domain": "tool_calling",
-        "parquet_API_url": "https://huggingface.co/api/datasets/hxssgaa/xlam-interleave-thinking-40k/parquet/default/train",
+        "parquet_API_url": "https://huggingface.co/api/datasets/Jofthomas/hermes-function-calling-thinking-V1/parquet/default/train",
+        "fallback_configs": [
+            ("Team-ACE/ToolACE", "default", "train"),
+            ("Salesforce/xlam-function-calling-60k", "default", "train"),
+        ],
     },
     {
         "dataset": "NousResearch/hermes-function-calling-v1",
-        "config": "default",
+        "config": "func_calling_singleturn",
         "split": "train",
         "domain": "tool_calling",
-        "parquet_API_url": "https://huggingface.co/api/datasets/NousResearch/hermes-function-calling-v1/parquet/default/train",
+        "parquet_API_url": "https://huggingface.co/api/datasets/NousResearch/hermes-function-calling-v1/parquet/func_calling_singleturn/train",
+        "fallback_configs": [
+            ("NousResearch/hermes-function-calling-v1", "func_calling", "train"),
+            ("Team-ACE/ToolACE", "default", "train"),
+            ("Jofthomas/hermes-function-calling-thinking-V1", "default", "train"),
+        ],
     },
     {
         "dataset": "nvidia/OpenCodeReasoning",
@@ -139,28 +151,42 @@ def get_today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def check_internet_connectivity(timeout_sec: float = 3.0) -> Tuple[bool, str]:
+def _urlopen_with_ssl_fallback(req: urllib.request.Request, timeout: float):
+    """Opens URL using system/certifi SSL certificates first, falling back if macOS Python lacks root certs."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), ssl.SSLError) or "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            ctx = ssl._create_unverified_context()
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        raise
+
+
+def check_internet_connectivity(timeout_sec: float = 8.0) -> Tuple[bool, str]:
     """
     Checks if Hugging Face is reachable over the internet.
     Returns `(is_online, detail_msg)`.
     """
     probe_urls = (
-        "https://datasets-server.huggingface.co/is-valid?dataset=open-thoughts%2FOpenThoughts-114k",
+        "https://datasets-server.huggingface.co/is-valid?dataset=open-thoughts%2FOpenThoughts3-1.2M",
         "https://huggingface.co/api/datasets/open-thoughts/OpenThoughts3-1.2M",
+        "https://huggingface.co",
     )
+    last_err = "Waiting for internet connection..."
     for url in probe_urls:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "SynapCore-AutoTrainer/2.0"},
+                headers={"User-Agent": "SynapCore-AutoTrainer/2.1"},
                 method="GET",
             )
-            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            with _urlopen_with_ssl_fallback(req, timeout=timeout_sec) as resp:
                 if 200 <= resp.status < 400:
                     return True, f"Connected ({url.split('/')[2]} HTTP {resp.status})"
-        except Exception:
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
             continue
-    return False, "Offline (Waiting for internet connection...)"
+    return False, f"Offline ({last_err})"
 
 
 class AutomatedDailyTrainerDaemon:
@@ -181,6 +207,8 @@ class AutomatedDailyTrainerDaemon:
         self.state_path: Path = self.datasets_dir / "daily_trainer_state.json"
         self.corpus_path: Path = self.datasets_dir / "domain_expert_corpus.jsonl"
         self.log_path: Path = self.datasets_dir / "auto_trainer_daemon.log"
+        self.lock_path: Path = self.datasets_dir / "auto_trainer_daemon.lock"
+        self.pid_path: Path = self.datasets_dir / "auto_trainer_daemon.pid"
 
         self.datasets_dir.mkdir(parents=True, exist_ok=True)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +216,7 @@ class AutomatedDailyTrainerDaemon:
         self.daily_limit_bytes: int = int(round(float(daily_limit_gb) * BYTES_PER_GIB))
         self.batch_rows: int = max(10, min(100, int(batch_rows)))
         self._stop_requested: bool = False
+        self._deduplicate_corpus_if_bloated()
         self.state: DailyTrainerState = self._load_or_init_state()
 
     def _log(self, msg: str) -> None:
@@ -195,10 +224,88 @@ class AutomatedDailyTrainerDaemon:
         line = f"[{ts}] {msg}"
         print(line, flush=True)
         try:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            # Avoid duplicate log entries when launchd redirects stdout/stderr to self.log_path
+            stdout_same_as_log = False
+            stderr_same_as_log = False
+            if self.log_path.exists():
+                try:
+                    stdout_same_as_log = os.path.samefile(sys.stdout.fileno(), self.log_path)
+                except Exception:
+                    stdout_same_as_log = False
+                try:
+                    stderr_same_as_log = os.path.samefile(sys.stderr.fileno(), self.log_path)
+                except Exception:
+                    stderr_same_as_log = False
+            if not stdout_same_as_log and not stderr_same_as_log:
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
         except Exception:
             pass
+
+    def _deduplicate_corpus_if_bloated(self) -> None:
+        """
+        Cleans up any exponential fallback duplication in `domain_expert_corpus.jsonl`
+        and removes oversized duplicate fallback batch files (> 25 MiB).
+        """
+        try:
+            for bf in list(self.batches_dir.glob("batch_*.jsonl")):
+                if bf.exists() and bf.stat().st_size > 25 * BYTES_PER_MIB:
+                    bf.unlink(missing_ok=True)
+
+            if not self.corpus_path.exists() or self.corpus_path.stat().st_size < 50 * BYTES_PER_MIB:
+                return
+
+            seen_keys: set[Tuple[str, str]] = set()
+            unique_rows: List[str] = []
+
+            for bf in sorted(self.batches_dir.glob("batch_*.jsonl")):
+                if not bf.exists() or bf.stat().st_size > 25 * BYTES_PER_MIB:
+                    continue
+                with open(bf, "r", encoding="utf-8", errors="ignore") as f_in:
+                    for line in f_in:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            dom = str(obj.get("domain", ""))
+                            prm = str(obj.get("prompt", ""))[:256]
+                            key = (dom, prm)
+                            if dom and prm and key not in seen_keys:
+                                seen_keys.add(key)
+                                unique_rows.append(json.dumps(obj, ensure_ascii=False))
+                        except Exception:
+                            continue
+
+            with open(self.corpus_path, "r", encoding="utf-8", errors="ignore") as f_in:
+                for idx_line, line in enumerate(f_in):
+                    if idx_line >= 2000:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        dom = str(obj.get("domain", ""))
+                        prm = str(obj.get("prompt", ""))[:256]
+                        key = (dom, prm)
+                        if dom and prm and key not in seen_keys:
+                            seen_keys.add(key)
+                            unique_rows.append(json.dumps(obj, ensure_ascii=False))
+                    except Exception:
+                        continue
+
+            if unique_rows:
+                tmp_corpus = self.corpus_path.with_suffix(".jsonl.tmp")
+                with open(tmp_corpus, "w", encoding="utf-8") as f_out:
+                    for r_str in unique_rows:
+                        f_out.write(r_str + "\n")
+                tmp_corpus.replace(self.corpus_path)
+                self._log(
+                    f"[Corpus Cleanup] Deduplicated domain_expert_corpus.jsonl to {len(unique_rows)} unique SFT trajectories."
+                )
+        except Exception as exc:
+            self._log(f"[Corpus Cleanup] Note: {exc}")
 
     def _load_or_init_state(self) -> DailyTrainerState:
         today = get_today_str()
@@ -214,12 +321,15 @@ class AutomatedDailyTrainerDaemon:
             try:
                 raw: DailyTrainerState = json.loads(self.state_path.read_text())
                 raw["daily_limit_bytes"] = self.daily_limit_bytes
-                # Roll over daily quota counter automatically on a new calendar day!
+                if "dataset_cursors" not in raw or not isinstance(raw["dataset_cursors"], dict):
+                    raw["dataset_cursors"] = {}
+                for spec in HF_DATASET_SOURCES:
+                    raw["dataset_cursors"].setdefault(spec["dataset"], 0)
                 if raw.get("current_date") != today:
                     raw["current_date"] = today
                     raw["today_bytes_downloaded"] = 0
                     raw["last_status"] = f"New day ({today}): 5.00 GiB quota reset & ready"
-                if init_root and not raw.get("active_merkle_root"):
+                if init_root:
                     raw["active_merkle_root"] = init_root
                 self._save_state(raw)
                 return raw
@@ -247,15 +357,61 @@ class AutomatedDailyTrainerDaemon:
         self._save_state(state)
         return state
 
+    def _sync_state_from_disk(self) -> None:
+        """
+        Merges any newer state written to `daily_trainer_state.json` by another process
+        so background daemons never overwrite newer batch counts or dataset cursors.
+        """
+        if not self.state_path.exists():
+            return
+        try:
+            disk_state: DailyTrainerState = json.loads(self.state_path.read_text())
+            if int(disk_state.get("total_batches_trained", 0)) > int(self.state.get("total_batches_trained", 0)):
+                self.state["total_batches_trained"] = int(disk_state["total_batches_trained"])
+                self.state["last_batch_domain"] = str(disk_state.get("last_batch_domain", self.state["last_batch_domain"]))
+                self.state["last_batch_source"] = str(disk_state.get("last_batch_source", self.state["last_batch_source"]))
+                self.state["last_router_loss_before"] = float(disk_state.get("last_router_loss_before", self.state["last_router_loss_before"]))
+                self.state["last_router_loss_after"] = float(disk_state.get("last_router_loss_after", self.state["last_router_loss_after"]))
+                if disk_state.get("active_merkle_root"):
+                    self.state["active_merkle_root"] = str(disk_state["active_merkle_root"])
+            self.state["total_samples_trained"] = max(
+                int(self.state.get("total_samples_trained", 0)),
+                int(disk_state.get("total_samples_trained", 0)),
+            )
+            self.state["total_bytes_downloaded_all_time"] = max(
+                int(self.state.get("total_bytes_downloaded_all_time", 0)),
+                int(disk_state.get("total_bytes_downloaded_all_time", 0)),
+            )
+            if disk_state.get("current_date") == self.state.get("current_date"):
+                self.state["today_bytes_downloaded"] = max(
+                    int(self.state.get("today_bytes_downloaded", 0)),
+                    int(disk_state.get("today_bytes_downloaded", 0)),
+                )
+            for ds_k, cur_v in disk_state.get("dataset_cursors", {}).items():
+                self.state["dataset_cursors"][ds_k] = max(
+                    int(self.state["dataset_cursors"].get(ds_k, 0)),
+                    int(cur_v),
+                )
+            for sc_k, sc_v in disk_state.get("sub_cluster_updates", {}).items():
+                self.state["sub_cluster_updates"][sc_k] = max(
+                    int(self.state["sub_cluster_updates"].get(sc_k, 0)),
+                    int(sc_v),
+                )
+        except Exception:
+            pass
+
     def _save_state(self, state: Optional[DailyTrainerState] = None) -> None:
         if state is not None:
             self.state = state
+        else:
+            self._sync_state_from_disk()
         self.state["last_updated_iso"] = datetime.now().isoformat()
-        tmp_path = self.state_path.with_suffix(".json.tmp")
+        tmp_path = self.state_path.with_suffix(".json.atomic")
         tmp_path.write_text(json.dumps(self.state, indent=2))
         tmp_path.replace(self.state_path)
 
     def refresh_daily_window(self) -> None:
+        self._sync_state_from_disk()
         today = get_today_str()
         if self.state["current_date"] != today:
             self._log(
@@ -264,7 +420,10 @@ class AutomatedDailyTrainerDaemon:
             )
             self.state["current_date"] = today
             self.state["today_bytes_downloaded"] = 0
-            self._save_state()
+            self.state["last_updated_iso"] = datetime.now().isoformat()
+            tmp_path = self.state_path.with_suffix(".json.atomic")
+            tmp_path.write_text(json.dumps(self.state, indent=2))
+            tmp_path.replace(self.state_path)
 
     def remaining_quota_bytes(self) -> int:
         self.refresh_daily_window()
@@ -275,7 +434,7 @@ class AutomatedDailyTrainerDaemon:
 
     @staticmethod
     def _extract_prompt_and_response(row_data: Dict[str, object]) -> Optional[Tuple[str, str]]:
-        # Format 1: ShareGPT / OpenThoughts `conversations` list
+        # Format 1: ShareGPT / OpenThoughts / Hermes / ToolACE `conversations` or `messages` list
         convs = row_data.get("conversations") or row_data.get("messages")
         if isinstance(convs, list) and len(convs) >= 2:
             u_text = ""
@@ -285,14 +444,14 @@ class AutomatedDailyTrainerDaemon:
                     continue
                 role = str(msg.get("from", msg.get("role", ""))).lower()
                 val = str(msg.get("value", msg.get("content", ""))).strip()
-                if role in ("human", "user") and not u_text:
+                if role in ("human", "user") and not u_text and val:
                     u_text = val
-                elif role in ("gpt", "assistant", "model") and not a_text:
+                elif role in ("gpt", "assistant", "model", "bing", "chatgpt") and u_text and not a_text and val:
                     a_text = val
             if u_text and a_text:
                 return u_text, a_text
 
-        # Format 2: `input` / `output` or `problem` / `solution` or `question` / `response`
+        # Format 2: `input` / `output` or `problem` / `solution` or `question` / `response` or `query` / `answers`
         for p_key, r_key in (
             ("input", "output"),
             ("problem", "solution"),
@@ -300,6 +459,7 @@ class AutomatedDailyTrainerDaemon:
             ("question", "response"),
             ("prompt", "response"),
             ("query", "answers"),
+            ("instruction", "output"),
         ):
             p_val = row_data.get(p_key)
             r_val = row_data.get(r_key)
@@ -314,7 +474,7 @@ class AutomatedDailyTrainerDaemon:
         self, source_idx: Optional[int] = None
     ) -> Tuple[str, str, List[Dict[str, str]], int]:
         """
-        Downloads the next resumable batch from Hugging Face Datasets Server API (or Parquet slice),
+        Downloads the next resumable batch from Hugging Face Datasets Server API,
         strictly respecting `remaining_quota_bytes()`.
         Returns `(domain, dataset_name, parsed_samples, raw_bytes_downloaded)`.
         """
@@ -330,60 +490,84 @@ class AutomatedDailyTrainerDaemon:
         spec = HF_DATASET_SOURCES[idx % len(HF_DATASET_SOURCES)]
         ds_name = spec["dataset"]
         dom = spec["domain"]
-        cursor = int(self.state["dataset_cursors"].get(ds_name, 0))
 
-        url = (
-            f"https://datasets-server.huggingface.co/rows?"
-            f"dataset={urllib.parse.quote(ds_name)}&"
-            f"config={urllib.parse.quote(spec['config'])}&"
-            f"split={urllib.parse.quote(spec['split'])}&"
-            f"offset={cursor}&length={self.batch_rows}"
-        )
+        candidates: List[Tuple[str, str, str]] = [
+            (ds_name, spec["config"], spec["split"])
+        ]
+        for fb in spec.get("fallback_configs", []):
+            if fb not in candidates:
+                candidates.append(fb)
 
         parsed_samples: List[Dict[str, str]] = []
         raw_bytes_count = 0
+        used_ds_name = ds_name
+        live_downloaded = False
 
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "SynapCore-AutoTrainer/2.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw_payload = resp.read()
-                raw_bytes_count = len(raw_payload)
-                if raw_bytes_count > rem_bytes:
-                    # Trim to remaining daily quota
-                    raw_payload = raw_payload[:rem_bytes]
+        for cand_ds, cand_cfg, cand_split in candidates:
+            cursor = int(self.state["dataset_cursors"].get(cand_ds, 0))
+            url = (
+                f"https://datasets-server.huggingface.co/rows?"
+                f"dataset={urllib.parse.quote(cand_ds)}&"
+                f"config={urllib.parse.quote(cand_cfg)}&"
+                f"split={urllib.parse.quote(cand_split)}&"
+                f"offset={cursor}&length={self.batch_rows}"
+            )
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "SynapCore-AutoTrainer/2.1"})
+                with _urlopen_with_ssl_fallback(req, timeout=20.0) as resp:
+                    raw_payload = resp.read()
                     raw_bytes_count = len(raw_payload)
-                data = json.loads(raw_payload.decode("utf-8", errors="ignore"))
-                rows = data.get("rows", [])
-                for r in rows:
-                    row_obj = r.get("row", {})
-                    if isinstance(row_obj, dict):
-                        pair = self._extract_prompt_and_response(row_obj)
-                        if pair is not None:
-                            u_p, a_r = pair
-                            parsed_samples.append(
-                                {
-                                    "domain": dom,
-                                    "source": ds_name,
-                                    "prompt": u_p[:1024],
-                                    "response": a_r[:2048],
-                                }
+                    if raw_bytes_count > rem_bytes:
+                        raw_payload = raw_payload[:rem_bytes]
+                        raw_bytes_count = len(raw_payload)
+                    data = json.loads(raw_payload.decode("utf-8", errors="ignore"))
+                    rows = data.get("rows", [])
+                    for r in rows:
+                        row_obj = r.get("row", {})
+                        if isinstance(row_obj, dict):
+                            pair = self._extract_prompt_and_response(row_obj)
+                            if pair is not None:
+                                u_p, a_r = pair
+                                parsed_samples.append(
+                                    {
+                                        "domain": dom,
+                                        "source": cand_ds,
+                                        "prompt": u_p[:1024],
+                                        "response": a_r[:2048],
+                                    }
+                                )
+                    if parsed_samples:
+                        self.state["dataset_cursors"][cand_ds] = cursor + max(1, len(rows))
+                        if cand_ds != ds_name:
+                            self.state["dataset_cursors"][ds_name] = (
+                                int(self.state["dataset_cursors"].get(ds_name, 0)) + max(1, len(rows))
                             )
-                self.state["dataset_cursors"][ds_name] = cursor + max(1, len(rows))
-        except Exception as exc:
-            self._log(f"[HF Download] Live API note for {ds_name} (offset={cursor}): {exc}")
+                        used_ds_name = cand_ds
+                        live_downloaded = True
+                        break
+            except Exception as exc:
+                self._log(f"[HF Download] Live API note for {cand_ds} ({cand_cfg}/{cand_split} offset={cursor}): {exc}")
 
-        # If live endpoint returned empty or was rate-limited, synthesize from local seed corpus
-        # so offline/sandboxed tests can still verify incremental training & quota accounting
+        # If live endpoint returned empty or was rate-limited, read up to 16 local seed samples
+        # WITHOUT re-appending them back into `domain_expert_corpus.jsonl`
         if not parsed_samples and self.corpus_path.exists():
-            with open(self.corpus_path, "r", encoding="utf-8") as f_in:
+            cap = min(16, self.batch_rows)
+            seen_prompts: set[str] = set()
+            with open(self.corpus_path, "r", encoding="utf-8", errors="ignore") as f_in:
                 for line in f_in:
                     if not line.strip():
                         continue
-                    item = json.loads(line)
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
                     if item.get("domain") == dom:
-                        parsed_samples.append(item)
-                        if len(parsed_samples) >= min(16, self.batch_rows):
-                            break
+                        p_key = str(item.get("prompt", ""))[:128]
+                        if p_key not in seen_prompts:
+                            seen_prompts.add(p_key)
+                            parsed_samples.append(item)
+                            if len(parsed_samples) >= cap:
+                                break
             if raw_bytes_count == 0 and parsed_samples:
                 raw_bytes_count = sum(len(json.dumps(x).encode("utf-8")) for x in parsed_samples)
 
@@ -395,14 +579,15 @@ class AutomatedDailyTrainerDaemon:
             with open(batch_file, "w", encoding="utf-8") as bf:
                 for s_item in parsed_samples:
                     bf.write(json.dumps(s_item, ensure_ascii=False) + "\n")
-            with open(self.corpus_path, "a", encoding="utf-8") as cf:
-                for s_item in parsed_samples:
-                    cf.write(json.dumps(s_item, ensure_ascii=False) + "\n")
+            if live_downloaded:
+                with open(self.corpus_path, "a", encoding="utf-8") as cf:
+                    for s_item in parsed_samples:
+                        cf.write(json.dumps(s_item, ensure_ascii=False) + "\n")
 
         self.state["today_bytes_downloaded"] += int(raw_bytes_count)
         self.state["total_bytes_downloaded_all_time"] += int(raw_bytes_count)
         self._save_state()
-        return dom, ds_name, parsed_samples, raw_bytes_count
+        return dom, used_ds_name, parsed_samples, raw_bytes_count
 
     def train_incremental_batch(
         self,
@@ -534,7 +719,6 @@ class AutomatedDailyTrainerDaemon:
                 nll_post = float(-np.mean(np.log(np.clip(np.sum(probs_post[:, start_e:end_e], axis=-1), 1e-6, 1.0))))
                 losses_after.append(nll_post)
 
-            # Update rank-32 domain subspace adapter with exponential moving average (EMA)
             cov_batch = (Y_d.T @ X_d) / float(len(X_d))
             rank = 32
             q_mat, _ = np.linalg.qr(cov_batch @ domain_up[domain].T[:hidden_size, :rank] if domain_up[domain].shape == (rank, hidden_size) else cov_batch @ domain_up[domain])
@@ -556,8 +740,6 @@ class AutomatedDailyTrainerDaemon:
                 reasoning_up=domain_up["reasoning"].astype(np.float16),
             )
 
-            # Update targeted sub-cluster expert leaf in Layer 0..3 in-place inside `cas_expanded_experts.bin`
-            # and recompute the 3-Domain Merkle Tree roots!
             leaves_list: List[Dict[str, object]] = list(manifest["leaves"])  # type: ignore[arg-type]
             leaf_lookup: Dict[Tuple[int, int], int] = {
                 (int(item["layer_idx"]), int(item["expert_idx"])): idx_pos  # type: ignore[arg-type]
@@ -629,7 +811,6 @@ class AutomatedDailyTrainerDaemon:
             l_after = round(float(np.mean(losses_after)), 4)
             new_root = expanded_model_root_bytes.hex()
 
-            # Also train ThalamicRouterV2 (`thalamic_router_v2_state.npz`) on the same SFT batch
             v2_router = None
             try:
                 from native.thalamic_router_v2 import ThalamicRouterV2
@@ -643,6 +824,7 @@ class AutomatedDailyTrainerDaemon:
                 if v2_router is not None:
                     v2_router.expanded_bank.close()
 
+            self._sync_state_from_disk()
             cluster_key = f"{domain}_cluster_{target_sub_cluster}"
             self.state["sub_cluster_updates"][cluster_key] = (
                 self.state["sub_cluster_updates"].get(cluster_key, 0) + 1
@@ -711,11 +893,23 @@ class AutomatedDailyTrainerDaemon:
         max_batches: Optional[int] = None,
     ) -> None:
         """
-        Continuous background daemon loop:
-          - Automatically starts downloading & training batches whenever internet is connected.
-          - Automatically pauses when internet disconnects.
-          - Automatically stops for the day as soon as the 5.00 GiB daily download quota is reached!
+        Continuous background daemon loop with exclusive file locking so duplicate daemon
+        processes can never run concurrently.
         """
+        lock_file = open(self.lock_path, "w", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_file.close()
+            return
+
+        try:
+            lock_file.write(f"{os.getpid()}\n")
+            lock_file.flush()
+            self.pid_path.write_text(f"{os.getpid()}\n")
+        except Exception:
+            pass
+
         def _sig_handler(signum: int, _frame: object) -> None:
             self._log(f"Received signal {signum}; stopping daemon cleanly after current step...")
             self._stop_requested = True
@@ -724,39 +918,46 @@ class AutomatedDailyTrainerDaemon:
         signal.signal(signal.SIGTERM, _sig_handler)
 
         self._log(
-            f"SynapCore Auto-Trainer Daemon STARTED (Daily Quota: "
+            f"SynapCore Auto-Trainer Daemon STARTED (PID: {os.getpid()} | Daily Quota: "
             f"{self.daily_limit_bytes / BYTES_PER_GIB:.2f} GiB/day | Poll: {poll_interval_sec:.0f}s)"
         )
         batches_run = 0
-        while not self._stop_requested:
-            self.refresh_daily_window()
-            if self.is_daily_quota_reached():
-                self._log(
-                    f"Daily {self.daily_limit_bytes / BYTES_PER_GIB:.2f} GiB quota reached for "
-                    f"{self.state['current_date']}. Training stopped; sleeping until next day..."
-                )
-                time.sleep(min(poll_interval_sec, 60.0))
-                continue
+        try:
+            while not self._stop_requested:
+                self.refresh_daily_window()
+                if self.is_daily_quota_reached():
+                    self._log(
+                        f"Daily {self.daily_limit_bytes / BYTES_PER_GIB:.2f} GiB quota reached for "
+                        f"{self.state['current_date']}. Training stopped; sleeping until next day..."
+                    )
+                    time.sleep(min(poll_interval_sec, 60.0))
+                    continue
 
-            did_work = self.run_single_cycle(force_offline_fallback=False)
-            if did_work:
-                batches_run += 1
-                if max_batches is not None and batches_run >= max_batches:
-                    self._log(f"Completed requested {max_batches} batches. Exiting.")
-                    break
-                time.sleep(2.0)
-            else:
-                if max_batches is not None:
-                    break
-                time.sleep(poll_interval_sec)
+                did_work = self.run_single_cycle(force_offline_fallback=False)
+                if did_work:
+                    batches_run += 1
+                    if max_batches is not None and batches_run >= max_batches:
+                        self._log(f"Completed requested {max_batches} batches. Exiting.")
+                        break
+                    time.sleep(2.0)
+                else:
+                    if max_batches is not None:
+                        break
+                    time.sleep(poll_interval_sec)
 
-        self.state["last_status"] = "Daemon stopped cleanly (Checkpoint & Merkle Root saved)"
-        self._save_state()
-        self._log(self.state["last_status"])
+            self.state["last_status"] = "Daemon stopped cleanly (Checkpoint & Merkle Root saved)"
+            self._save_state()
+            self._log(self.state["last_status"])
+        finally:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+            except Exception:
+                pass
 
     def format_status_table(self) -> str:
         self.refresh_daily_window()
-        is_online, net_msg = check_internet_connectivity(timeout_sec=2.0)
+        is_online, net_msg = check_internet_connectivity(timeout_sec=4.0)
         used_b = self.state["today_bytes_downloaded"]
         lim_b = self.state["daily_limit_bytes"]
         pct = 100.0 * used_b / max(1, lim_b)
@@ -781,7 +982,7 @@ class AutomatedDailyTrainerDaemon:
         for spec in HF_DATASET_SOURCES:
             ds = spec["dataset"]
             cur = self.state["dataset_cursors"].get(ds, 0)
-            lines.append(f"    - {ds:<44} ({spec['domain']:<12}) : offset = {cur:,} rows")
+            lines.append(f"    - {ds:<46} ({spec['domain']:<12}) : offset = {cur:,} rows")
         lines.append("=" * 88)
         return "\n".join(lines)
 

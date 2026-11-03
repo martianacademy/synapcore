@@ -25,7 +25,7 @@
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/suru.martian/Documents/merkle-moe/olmoe_merkle_store/datasets/auto_trainer_daemon.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>/Users/suru.martian/Documents/merkle-moe/olmoe_merkle_store/datasets/auto_trainer_daemon.log</string>
 </dict>

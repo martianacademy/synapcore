@@ -1972,8 +1972,6 @@ if HAS_MLX_METAL:
 
             self.qkv_w: mx.array = mx.contiguous(qkv_w)
             self.o_w: mx.array = mx.contiguous(o_w)
-            self.qkv_w_T: mx.array = mx.contiguous(qkv_w.T)
-            self.o_w_T: mx.array = mx.contiguous(o_w.T)
 
             self.q_norm: Optional[nn.RMSNorm] = None
             self.k_norm: Optional[nn.RMSNorm] = None
@@ -1998,7 +1996,7 @@ if HAS_MLX_METAL:
             cache: Optional[KVCache] = None,
         ) -> mx.array:
             B, L, _ = x.shape
-            qkv = x @ self.qkv_w_T
+            qkv = x @ self.qkv_w.T
             if self.q_dim == self.kv_dim:
                 queries, keys, values = mx.split(qkv, 3, axis=-1)
             else:
@@ -2025,7 +2023,7 @@ if HAS_MLX_METAL:
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
             output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-            return output @ self.o_w_T
+            return output @ self.o_w.T
 
     class SynapCoreMLXLayer(nn.Module):
         def __init__(
@@ -2050,7 +2048,6 @@ if HAS_MLX_METAL:
             self.post_attention_layernorm.weight = post_norm_w
             self.self_attn = attn
             self.router_w: mx.array = mx.contiguous(router_w)
-            self.router_w_T: mx.array = mx.contiguous(router_w.T)
             self.router_b: Optional[mx.array] = router_b
             self.gpu_slot_map: Optional[mx.array] = gpu_slot_map
             self.layer_idx: int = int(layer_idx)
@@ -2080,12 +2077,12 @@ if HAS_MLX_METAL:
                 )
                 exec_indices = mx.take(self.gpu_slot_map, indices) if self.gpu_slot_map is not None else indices
             elif self.router_b is not None and self.gpu_slot_map is not None:
-                router_logits = x_flat @ self.router_w_T
+                router_logits = x_flat @ self.router_w.T
                 exec_indices, scores, _ = self.route_expanded_fn(
                     router_logits, self.router_b, self.gpu_slot_map
                 )
             else:
-                router_logits = x_flat @ self.router_w_T
+                router_logits = x_flat @ self.router_w.T
                 if self.router_b is not None:
                     router_logits = router_logits + self.router_b
                 indices, scores = self.route_fn(router_logits)
@@ -2110,12 +2107,12 @@ if HAS_MLX_METAL:
                 )
                 exec_indices = mx.take(self.gpu_slot_map, indices) if self.gpu_slot_map is not None else indices
             elif self.router_b is not None and self.gpu_slot_map is not None:
-                router_logits = x_flat @ self.router_w_T
+                router_logits = x_flat @ self.router_w.T
                 exec_indices, scores, indices = self.route_expanded_fn(
                     router_logits, self.router_b, self.gpu_slot_map
                 )
             else:
-                router_logits = x_flat @ self.router_w_T
+                router_logits = x_flat @ self.router_w.T
                 if self.router_b is not None:
                     router_logits = router_logits + self.router_b
                 indices, scores = self.route_fn(router_logits)
@@ -2653,6 +2650,11 @@ class NativeMerkleMoEEngine:
             str(tools_json or ""),
         )
         if self.use_mlx and HAS_MLX_METAL and hasattr(self, "mlx_layers"):
+            if self.router_version != "v2" and not self.on_demand_streaming:
+                for layer_mod in self.mlx_layers:
+                    layer_mod.thalamic_v2 = None
+                self._last_domain_routing_sig = sig
+                return
             active_v2 = self.thalamic_router_v2 if self.router_version == "v2" else None
             if sig == self._last_domain_routing_sig:
                 for layer_mod in self.mlx_layers:
@@ -2665,7 +2667,6 @@ class NativeMerkleMoEEngine:
                     l_idx, base_rw, prof
                 )
                 layer_mod.router_w = mx.contiguous(mx.array(full_rw))
-                layer_mod.router_w_T = mx.contiguous(layer_mod.router_w.T)
                 layer_mod.router_b = mx.array(full_rb.astype(np.float16))
                 layer_mod.thalamic_v2 = active_v2
             mx.eval([l.router_w for l in self.mlx_layers], [l.router_b for l in self.mlx_layers if l.router_b is not None])
@@ -3012,12 +3013,13 @@ class NativeMerkleMoEEngine:
 
     def _init_mlx_backend(self, shared_mlx_model: Optional["MLXBaseModelProtocol"] = None) -> None:
         self.mlx_stream = mx.new_thread_local_stream(mx.default_device())
-        try:
-            set_lim = getattr(mx, "set_cache_limit", None) or getattr(mx.metal, "set_cache_limit", None)
-            if set_lim is not None:
-                set_lim(32 * 1024 * 1024)
-        except Exception:
-            pass
+        if self.on_demand_streaming:
+            try:
+                set_lim = getattr(mx, "set_cache_limit", None) or getattr(mx.metal, "set_cache_limit", None)
+                if set_lim is not None:
+                    set_lim(32 * 1024 * 1024)
+            except Exception:
+                pass
 
         core_arrays: Dict[str, mx.array] = {
             t_name: mx.array(np_view) for t_name, np_view in self.core_np_views.items()
@@ -3137,7 +3139,12 @@ class NativeMerkleMoEEngine:
             post_norm_w = core_arrays.pop(f"{p}.post_attention_layernorm.weight")
             base_router_arr = core_arrays.pop(f"{p}.mlp.gate.weight")
             router_b_arr: Optional[mx.array] = None
-            if self.enable_expanded_experts and self.expanded_bank is not None:
+            use_exp_mlx = (
+                self.enable_expanded_experts
+                and self.expanded_bank is not None
+                and (self.router_version == "v2" or self.on_demand_streaming)
+            )
+            if use_exp_mlx:
                 base_rw_np = self.core_np_views[f"{p}.mlp.gate.weight"]
                 full_rw_np, full_rb_np = self.expanded_bank.get_expanded_router_for_layer(  # type: ignore[attr-defined]
                     l_idx, base_rw_np, self.active_domain_profile
@@ -3157,7 +3164,7 @@ class NativeMerkleMoEEngine:
                 attn=attn,
                 switch_mlp=switch_mlp,
                 router_b=router_b_arr,
-                gpu_slot_map=shared_gpu_slot_map if is_layer_pinned else None,
+                gpu_slot_map=(shared_gpu_slot_map if (is_layer_pinned and use_exp_mlx) else None),
                 layer_idx=l_idx,
                 thalamic_v2=self.thalamic_router_v2 if self.router_version == "v2" else None,
             )
@@ -3175,7 +3182,7 @@ class NativeMerkleMoEEngine:
         with mx.stream(self.mlx_stream):
             dummy_cache = [KVCache() for _ in range(self.num_layers)]
             logits = self._mlx_forward_fast(
-                mx.array([[1, 2]], dtype=mx.int32), dummy_cache, record_live_routing=True
+                mx.array([[1, 2]], dtype=mx.int32), dummy_cache, record_live_routing=False
             )
             mx.eval(logits)
             logits2 = self._mlx_forward_fast(
@@ -3276,6 +3283,21 @@ class NativeMerkleMoEEngine:
     ) -> np.ndarray:
         self.async_pipeline.wait_pending_prefetches()
         routed_trace_np = self.live_routing_buffer.flush()
+        if routed_trace_np.shape[0] == 0 and self.use_mlx and HAS_MLX_METAL and not self.on_demand_streaming:
+            sample_ids = (prompt_ids + generated_ids)[-16:]
+            if sample_ids:
+                with mx.stream(self.mlx_stream):
+                    seq_arr = mx.array([sample_ids], dtype=mx.int32)
+                    h = self.mlx_embed_weight[seq_arr]
+                    mask = create_attention_mask(h, None)
+                    layer_indices = []
+                    for layer in self.mlx_layers:
+                        h, inds = layer.forward_with_trace(h, mask, None)
+                        layer_indices.append(inds)
+                    stacked = mx.stack(layer_indices, axis=1)
+                    mx.eval(stacked)
+                    routed_trace_np = np.array(stacked, dtype=np.int32)
+                    self.live_routing_buffer.record_numpy_step(routed_trace_np)
         self._record_batched_telemetry(prompt_ids, generated_ids, routed_trace_np)
         return routed_trace_np
 

@@ -573,13 +573,10 @@ class StandaloneSynapCoreChat:
         with mx.stream(self.native_engine.mlx_stream):
             if rem_arr.size > 1:
                 self.native_engine._mlx_forward_fast(
-                    rem_arr[:-1][None], cache, record_live_routing=True
+                    rem_arr[:-1][None], cache, record_live_routing=False
                 )
                 mx.eval([c.state for c in cache])
-            logits_first = self.native_engine._mlx_forward_fast(
-                rem_arr[-1:][None], cache, record_live_routing=True
-            )
-            y = mx.argmax(logits_first, axis=-1)
+            y = _step(rem_arr[-1:])
             if not self.enable_profiler:
                 mx.async_eval(y)
                 mx.eval(y)

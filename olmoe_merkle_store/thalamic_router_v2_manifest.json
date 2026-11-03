@@ -11,7 +11,7 @@
   "domain_topdown_scale": 0.45,
   "kappa_neuromod": 0.55,
   "lambda_hebbian": 0.32,
-  "hebbian_updates_applied": 160,
-  "hebbian_matrix_l2_norm": 2.875065,
-  "state_sha256": "48b76744c1f39b56cf7217c4e74c21ffc98241dff48b7950910a1ce6db0bf042"
+  "hebbian_updates_applied": 1264,
+  "hebbian_matrix_l2_norm": 4.145616,
+  "state_sha256": "2093d7ee982166379d95925d2ccad4379290aac4bf649a6252340b9e3ca0fa24"
 }

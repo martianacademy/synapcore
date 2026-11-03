@@ -13,6 +13,8 @@ Verifies:
 
 from __future__ import annotations
 
+import copy
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -31,23 +33,24 @@ class TestAutoDailyTrainerDaemon(unittest.TestCase):
         daemon = AutomatedDailyTrainerDaemon(store_dir=STORE_DIR, daily_limit_gb=5.0, batch_rows=20)
         self.assertEqual(daemon.daily_limit_bytes, 5 * BYTES_PER_GIB)
 
-        # Simulate reaching 5.0 GiB quota today -> run_single_cycle must auto-stop and return False
-        orig_today_bytes = daemon.state["today_bytes_downloaded"]
+        # Preserve full original state on disk so unit tests never overwrite live daemon progress
+        orig_state = copy.deepcopy(daemon.state)
         try:
             daemon.state["today_bytes_downloaded"] = 5 * BYTES_PER_GIB + 1024
-            daemon._save_state()
+            daemon.state_path.write_text(json.dumps(daemon.state, indent=2))
             self.assertTrue(daemon.is_daily_quota_reached())
             self.assertFalse(daemon.run_single_cycle(force_offline_fallback=True))
             self.assertIn("Daily quota reached", daemon.state["last_status"])
 
             # Simulate date rollover from yesterday -> today_bytes_downloaded must reset to 0 automatically
             daemon.state["current_date"] = "2020-01-01"
+            daemon.state_path.write_text(json.dumps(daemon.state, indent=2))
             daemon.refresh_daily_window()
             self.assertEqual(daemon.state["today_bytes_downloaded"], 0)
             self.assertFalse(daemon.is_daily_quota_reached())
         finally:
-            daemon.state["today_bytes_downloaded"] = orig_today_bytes
-            daemon._save_state()
+            daemon.state = orig_state
+            daemon.state_path.write_text(json.dumps(orig_state, indent=2))
 
     def test_02_incremental_batch_download_and_256_expert_merkle_update(self) -> None:
         daemon = AutomatedDailyTrainerDaemon(store_dir=STORE_DIR, daily_limit_gb=5.0, batch_rows=15)

@@ -737,10 +737,29 @@ def get_mlx_memory_metrics_mb() -> Tuple[float, float, float]:
         return 0.0, 0.0, 0.0
 
 
+HAS_TORCH: bool = False
+HAS_TORCH_CUDA: bool = False
+try:
+    import torch
+
+    HAS_TORCH = True
+    HAS_TORCH_CUDA = bool(torch.cuda.is_available())
+except Exception:
+    HAS_TORCH = False
+    HAS_TORCH_CUDA = False
+
+
 def resolve_device(requested: str = "auto") -> str:
-    if requested in ("auto", "mlx", "mps"):
+    req = requested.strip().lower()
+    if req.startswith("cuda"):
+        return req if HAS_TORCH_CUDA else "cpu"
+    if req in ("auto",):
+        if HAS_TORCH_CUDA:
+            return "cuda"
         return "mlx" if HAS_MLX_METAL else "cpu"
-    return requested
+    if req in ("mlx", "mps"):
+        return "mlx" if HAS_MLX_METAL else "cpu"
+    return req
 
 
 def madvise_range(mm_obj: mmap.mmap, offset: int, length: int, advice: int = MADV_WILLNEED) -> bool:
@@ -1262,8 +1281,11 @@ class NativeMmapIndexBridge:
         self.bin_path: Path = Path(__file__).resolve().parent / "synapcore_native_bin"
         self.idx_path: Path = self.store_dir / "merkle_tree.idx"
 
-        if not self.bin_path.exists():
-            compile_native_binaries()
+        if sys.platform == "darwin" and not self.bin_path.exists():
+            try:
+                compile_native_binaries()
+            except Exception:
+                pass
         if not self.idx_path.exists():
             build_native_merkle_tree_idx(self.store_dir)
 

@@ -45,6 +45,9 @@ def compile_native_binaries() -> Path:
     bin_path = NATIVE_DIR / "synapcore_native_bin"
     dylib_path = NATIVE_DIR / "libsynapcore_native.dylib"
 
+    if os.uname().sysname.lower() != "darwin":
+        return bin_path
+
     print(f"[1/3] Compiling Native C++17 / Objective-C++ Metal Core -> {bin_path.name}...")
     cmd_bin = [
         "clang++",
@@ -212,12 +215,23 @@ def build_native_merkle_tree_idx(store_dir: Path) -> Path:
     return idx_path
 
 
-def _ensure_symlink(src: Path, dst: Path) -> None:
-    if dst.is_symlink() or dst.exists():
-        if dst.is_symlink() and dst.resolve() == src.resolve():
-            return
-        dst.unlink()
-    os.symlink(str(src), str(dst))
+def _ensure_symlink(src: Path, dst: Path, copy_if_symlink_fails: bool = False) -> bool:
+    src_abs = Path(src).expanduser().resolve()
+    dst = Path(dst)
+    try:
+        if dst.is_symlink() or dst.exists():
+            if dst.is_symlink() and dst.resolve() == src_abs:
+                return True
+            dst.unlink()
+        os.symlink(str(src_abs), str(dst))
+        return True
+    except (PermissionError, OSError):
+        if copy_if_symlink_fails and src_abs.exists():
+            import shutil
+
+            shutil.copyfile(str(src_abs), str(dst))
+            return True
+        return False
 
 
 def build_qwen38_merkle_store(

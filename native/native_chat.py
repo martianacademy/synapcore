@@ -854,7 +854,12 @@ def main() -> None:
     parser.add_argument("--kv-max-pages", type=int, default=64)
     parser.add_argument("--kv-quant", type=str, default="fp16", choices=["fp16", "int8"])
     parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "mps", "mlx", "cpu"])
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "mps", "mlx", "cpu"],
+    )
     parser.add_argument("--prompt", type=str, default=None)
     args = parser.parse_args()
 

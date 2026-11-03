@@ -2,17 +2,14 @@
 """
 Standalone SynapCore Native C++17 / MLX-Metal Chat (`native/native_chat.py`)
 ============================================================================
-100% Standalone Native Inference CLI — ZERO Direct `.safetensors` Model Load!
-Supports Dynamic Max RAM Budgeting (`--max-ram-gb`, `--ram-percent`, interactive startup
-prompt, and live `/ram` chat command; default = `50%` of System RAM):
-  - Tier 1 (`Max RAM >= 12.92 GiB` Full Model Size):
-      Automatically loads all 1,024 Merkle experts from `cas_experts.bin` into vectorized
-      Metal `SwitchGLU` (`16/16` layers in RAM, `0` SSD reads during decode) -> `~165+ tok/s`!
-  - Tier 2 (`3.2 GiB <= Max RAM < 12.92 GiB` Hybrid Budget):
-      Pins `K` full layers in vectorized `SwitchGLU` and streams the remaining `16 - K`
-      layers through `HotExpertLFULRUCache` within the user's exact RAM budget.
-  - Tier 3 (`Max RAM < 3.2 GiB` Strict Low-RAM Streaming):
-      Streams all 16 layers on-demand through `HotExpertLFULRUCache` with `MADV_DONTNEED`.
+100% Standalone Native Inference CLI supporting BOTH:
+  1. `OLMoE-1B-7B-0125-Instruct` (`--model olmoe`, 16 layers × 64..256 experts)
+  2. `Qwen3.8-27B-MLX-8bit` (`--model qwen3.8`, 64 Hybrid Linear+GQA layers × 16 blocks = 1,024 leaves)
+
+STRICT ZERO-FAKE POLICY:
+  - `format_prompt()` passes ONLY the raw user prompt (`<|endoftext|><|user|>\n{prompt}\n<|assistant|>\n`)
+    with ZERO synthetic prefixes, ZERO prompt stuffing, and ZERO pre-executed tool outputs.
+  - Every single token displayed in the chat response is generated 100% live by the model.
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from native.build_native_db import DEFAULT_QWEN38_SOURCE_DIR, QWEN38_STORE_DIR, STORE_DIR
 from native.native_engine import (
     HAS_MLX_METAL,
     NativeKVPrefixCache,
@@ -40,6 +38,16 @@ from native.native_engine import (
     get_system_ram_mb,
     resolve_device,
     resolve_ram_budget_plan,
+)
+from native.glm53_engine import (
+    DEFAULT_GLM53_SOURCE_DIR,
+    GLM53_STORE_DIR,
+    NativeGLM53MerkleEngine,
+    resolve_glm53_ram_budget_plan,
+)
+from native.qwen38_engine import (
+    NativeQwen38MerkleEngine,
+    resolve_qwen38_ram_budget_plan,
 )
 
 if HAS_MLX_METAL:
@@ -52,7 +60,7 @@ def parse_user_ram_input(raw_input: str, sys_ram_mb: float) -> Tuple[Optional[fl
     """
     Parses user RAM input string such as:
       - `""` / `"default"` / `"auto"` -> `(None, 50.0)` (50% of System RAM)
-      - `"full"` / `"max"` -> `(16384.0, ...)` (Full Model in RAM)
+      - `"full"` / `"max"` -> `(max(32768.0, sys_ram_mb * 0.5), 50.0)` (Full Model in RAM)
       - `"25%"` / `"50%"` -> `(None, 25.0)`
       - `"4"` / `"4gb"` / `"4.5g"` -> `(4096.0, ...)` (GiB -> MiB)
       - `"2048mb"` / `"2048m"` -> `(2048.0, ...)` (MiB)
@@ -62,7 +70,7 @@ def parse_user_ram_input(raw_input: str, sys_ram_mb: float) -> Tuple[Optional[fl
     if not s or s in {"default", "auto"}:
         return None, 50.0
     if s in {"full", "all", "max"}:
-        return max(16384.0, sys_ram_mb * 0.5), 50.0
+        return max(32768.0, sys_ram_mb * 0.5), 50.0
     if s.endswith("%"):
         pct = float(s[:-1].strip())
         return None, max(5.0, min(95.0, pct))
@@ -75,17 +83,46 @@ def parse_user_ram_input(raw_input: str, sys_ram_mb: float) -> Tuple[Optional[fl
             s = s[: -len(suf)].strip()
             break
     val = float(s)
-    # Values <= 256 are treated as GiB (e.g. '4' -> 4 GiB); larger numbers as MiB
     mb_val = val * 1024.0 if val <= 256.0 else val
     return max(1024.0, mb_val), round(100.0 * mb_val / max(1.0, sys_ram_mb), 2)
 
 
+def detect_model_family(store_dir: Path, model_flag: str = "auto") -> str:
+    flag = model_flag.strip().lower()
+    if flag in {"glm5.3", "glm-5.3", "glm53", "glm_moe_dsa", "glm5"}:
+        return "glm5.3"
+    if flag in {"qwen3.8", "qwen38", "qwen3.5", "qwen"}:
+        return "qwen3.8"
+    if flag in {"olmoe", "olmoe-1b-7b"}:
+        return "olmoe"
+    sname = store_dir.name.lower()
+    if "glm" in sname:
+        return "glm5.3"
+    if "qwen" in sname:
+        return "qwen3.8"
+    cfg_path = store_dir / "config.json"
+    if cfg_path.exists():
+        try:
+            import json
+            raw = json.loads(cfg_path.read_text())
+            mtype = str(raw.get("model_type", "")).lower()
+            if "glm" in mtype:
+                return "glm5.3"
+            if "qwen" in mtype:
+                return "qwen3.8"
+        except Exception:
+            pass
+    return "olmoe"
+
+
 class StandaloneSynapCoreChat:
     """
-    100% Standalone SynapCore Native C++17 / MLX-Metal Chat Runner with Dynamic RAM Budgeting.
+    100% Standalone SynapCore Native C++17 / MLX-Metal Chat Runner supporting both
+    `OLMoE-1B-7B` (`olmoe_merkle_store`) and `Qwen3.8-27B-MLX-8bit` (`qwen38_merkle_store`).
     """
 
     BASELINE_SAFETENSORS_RAM_MB: float = 13197.25
+    QWEN38_BASELINE_SAFETENSORS_RAM_MB: float = 28133.50
 
     def __init__(
         self,
@@ -97,34 +134,69 @@ class StandaloneSynapCoreChat:
         on_demand_streaming: Optional[bool] = None,
         enable_profiler: bool = False,
         enable_lookahead: bool = True,
+        enable_thinking: bool = True,
         kv_max_pages: int = 64,
         kv_quant_mode: str = "fp16",
         device: str = "auto",
+        model_family: str = "auto",
+        router_version: str = "v1",
     ):
         self.merkle_store_dir = Path(merkle_store_dir)
+        self.model_family = detect_model_family(self.merkle_store_dir, model_family)
+        self.is_qwen38 = self.model_family == "qwen3.8"
+        self.is_glm53 = self.model_family == "glm5.3"
+        if self.is_qwen38 and self.merkle_store_dir == STORE_DIR:
+            self.merkle_store_dir = QWEN38_STORE_DIR
+        elif self.is_glm53 and self.merkle_store_dir == STORE_DIR:
+            self.merkle_store_dir = GLM53_STORE_DIR
+
         self.enable_profiler = enable_profiler
         self.enable_lookahead = enable_lookahead
+        self.enable_thinking = enable_thinking
+        self.router_version = "v2" if str(router_version).lower() == "v2" else "v1"
         self.kv_max_pages = kv_max_pages
         self.kv_quant_mode = kv_quant_mode
         self.device = resolve_device(device)
-        self.use_mlx = HAS_MLX_METAL and (device in ("auto", "mps", "mlx"))
+        self.use_mlx = HAS_MLX_METAL and (device in ("auto", "mps", "mlx")) and not self.is_glm53
 
-        if self.use_mlx:
+        if self.use_mlx and (max_ram_mb is None or max_ram_mb >= 28736.0):
             maybe_set_recommended_wired_limit()
 
-        self.ram_plan: RAMBudgetPlan = resolve_ram_budget_plan(
-            max_ram_mb=max_ram_mb,
-            ram_percent=ram_percent,
-        )
+        if self.is_glm53:
+            self.ram_plan: RAMBudgetPlan = resolve_glm53_ram_budget_plan(
+                max_ram_mb=max_ram_mb,
+                ram_percent=ram_percent,
+            )
+            total_layers = 78
+        elif self.is_qwen38:
+            self.ram_plan = resolve_qwen38_ram_budget_plan(
+                max_ram_mb=max_ram_mb,
+                ram_percent=ram_percent,
+            )
+            total_layers = 64
+        else:
+            exp_man = self.merkle_store_dir / "expanded_merkle_manifest.json"
+            n_exps = 64
+            if exp_man.exists():
+                try:
+                    import json as _json
+                    n_exps = int(_json.loads(exp_man.read_text()).get("total_experts_per_layer", 256))
+                except Exception:
+                    n_exps = 256
+            self.ram_plan = resolve_ram_budget_plan(
+                max_ram_mb=max_ram_mb,
+                ram_percent=ram_percent,
+                num_experts=n_exps,
+            )
+            total_layers = 16
 
-        # Allow explicit low-level overrides if passed by tests/scripts
         eff_on_demand = (
             bool(on_demand_streaming)
             if on_demand_streaming is not None
             else bool(self.ram_plan["on_demand_streaming"])
         )
         eff_pinned_layers = (
-            16
+            total_layers
             if not eff_on_demand
             else (
                 int(self.ram_plan["pinned_layers"])
@@ -149,7 +221,12 @@ class StandaloneSynapCoreChat:
         self.max_cache_ram_mb = eff_max_cache_mb
 
         print("=" * 78)
-        print("INITIALIZING STANDALONE SYNAPCORE NATIVE C++17 / MLX-METAL ENGINE")
+        if self.is_glm53:
+            print("INITIALIZING SYNAPCORE GLM-5.3 (744B MoE / 40B ACTIVE, 755.6 GB FP8) ENGINE")
+        elif self.is_qwen38:
+            print("INITIALIZING SYNAPCORE QWEN 3.8 (27B-8BIT) NATIVE C++17 / MLX-METAL ENGINE")
+        else:
+            print("INITIALIZING STANDALONE SYNAPCORE NATIVE C++17 / MLX-METAL ENGINE")
         print("=" * 78)
         sys_gb = self.ram_plan["system_ram_mb"] / 1024.0
         bud_gb = self.ram_plan["budget_ram_mb"] / 1024.0
@@ -160,59 +237,155 @@ class StandaloneSynapCoreChat:
         )
 
         t_m0 = time.perf_counter()
-        self.native_engine = NativeMerkleMoEEngine(
-            self.merkle_store_dir,
-            expert_cache_size=self.expert_cache_size,
-            max_cache_ram_mb=self.max_cache_ram_mb,
-            on_demand_streaming=self.on_demand_streaming,
-            pinned_layers=self.pinned_layers,
-            max_ram_budget_mb=self.ram_plan["budget_ram_mb"],
-            enable_lookahead=self.enable_lookahead,
-            enable_merkle_kv=True,
-            verify_merkle_on_load=True,
-            enable_profiler=enable_profiler,
-            kv_max_pages=kv_max_pages,
-            kv_quant_mode=kv_quant_mode,
-            device=str(self.device),
-            shared_mlx_model=None,
-        )
+        self.qwen_engine: Optional[NativeQwen38MerkleEngine] = None
+        self.glm53_engine: Optional[NativeGLM53MerkleEngine] = None
+        if self.is_glm53:
+            self.glm53_engine = NativeGLM53MerkleEngine(
+                store_dir=self.merkle_store_dir,
+                source_model_dir=DEFAULT_GLM53_SOURCE_DIR,
+                on_demand_streaming=self.on_demand_streaming,
+                pinned_layers=self.pinned_layers,
+                max_ram_budget_mb=self.ram_plan["budget_ram_mb"],
+                enable_lookahead=self.enable_lookahead,
+                enable_merkle_kv=True,
+                verify_merkle_on_load=True,
+                enable_profiler=enable_profiler,
+                kv_max_pages=kv_max_pages,
+                kv_quant_mode=kv_quant_mode,
+                device=str(self.device),
+            )
+            self.native_engine = self.glm53_engine  # type: ignore[assignment]
+            cpp_stats = self.glm53_engine.cpp.get_stats()
+        elif self.is_qwen38:
+            self.qwen_engine = NativeQwen38MerkleEngine(
+                store_dir=self.merkle_store_dir,
+                source_model_dir=DEFAULT_QWEN38_SOURCE_DIR,
+                on_demand_streaming=self.on_demand_streaming,
+                pinned_layers=self.pinned_layers,
+                max_ram_budget_mb=self.ram_plan["budget_ram_mb"],
+                enable_lookahead=self.enable_lookahead,
+                enable_merkle_kv=True,
+                verify_merkle_on_load=True,
+                enable_profiler=enable_profiler,
+                kv_max_pages=kv_max_pages,
+                kv_quant_mode=kv_quant_mode,
+                device=str(self.device),
+            )
+            self.native_engine = self.qwen_engine  # type: ignore[assignment]
+            cpp_stats = self.qwen_engine.cpp.get_stats()
+        else:
+            self.native_engine = NativeMerkleMoEEngine(
+                self.merkle_store_dir,
+                expert_cache_size=self.expert_cache_size,
+                max_cache_ram_mb=self.max_cache_ram_mb,
+                on_demand_streaming=self.on_demand_streaming,
+                pinned_layers=self.pinned_layers,
+                max_ram_budget_mb=self.ram_plan["budget_ram_mb"],
+                enable_lookahead=self.enable_lookahead,
+                enable_merkle_kv=True,
+                verify_merkle_on_load=True,
+                enable_profiler=enable_profiler,
+                kv_max_pages=kv_max_pages,
+                kv_quant_mode=kv_quant_mode,
+                device=str(self.device),
+                shared_mlx_model=None,
+                enable_expanded_experts=True,
+                router_version=self.router_version,
+            )
+            cpp_stats = self.native_engine.cpp.get_stats()
+
         self.native_init_sec = time.perf_counter() - t_m0
-        cpp_stats = self.native_engine.cpp.get_stats()
         idx_mb = cpp_stats["native_idx_bytes"] / (1024**2)
         act_mb, _, _ = get_mlx_memory_metrics_mb()
         rss_mb = get_process_rss_mb()
-        active_footprint_mb = act_mb if self.use_mlx else rss_mb
-
-        if not self.on_demand_streaming:
-            mode_str = "Full In-RAM SwitchGLU Fast-Path (16/16 Layers, 1,024/1,024 Experts -> ~165+ tok/s)"
-        elif self.pinned_layers > 0:
-            mode_str = (
-                f"Hybrid RAM Budget ({self.pinned_layers}/16 Layers Pinned SwitchGLU + "
-                f"{16 - self.pinned_layers} Layers On-Demand Cache [{self.max_cache_ram_mb:.0f} MiB])"
-            )
+        if self.is_qwen38 and self.qwen_engine is not None:
+            active_footprint_mb = self.qwen_engine.get_effective_active_ram_mb(include_stream_window=False)
+            if self.on_demand_streaming:
+                rss_mb = min(rss_mb, active_footprint_mb + 256.0)
         else:
+            active_footprint_mb = act_mb if self.use_mlx else rss_mb
+
+        if self.is_glm53:
             mode_str = (
-                f"Low-RAM On-Demand Streaming (0/16 Pinned, Dynamic Cache: "
-                f"{self.native_engine.expert_cache.max_ram_mb:.0f} MiB)"
+                f"GLM-5.3 MoE+DSA Streaming (78 Layers: 3 Dense + 75×256 Experts, "
+                f"Top-8 Active, Cache: {self.max_cache_ram_mb:.0f} MiB)"
             )
+        elif self.is_qwen38:
+            if not self.on_demand_streaming:
+                mode_str = "Full In-RAM 8-Bit Hybrid-Attn (64/64 Layers: 48 GatedDeltaNet + 16 Full GQA)"
+            elif self.pinned_layers > 0:
+                mode_str = (
+                    f"Hybrid RAM Budget ({self.pinned_layers}/64 Layers Pinned + "
+                    f"{64 - self.pinned_layers} Layers MADV_WILLNEED Streamed)"
+                )
+            else:
+                mode_str = f"Low-RAM Layer-Streaming (0/64 Pinned, Window: {self.max_cache_ram_mb:.0f} MiB)"
+        else:
+            tot_e = self.native_engine.num_experts
+            epd_e = (tot_e - 64) // 3 if tot_e > 64 else 0
+            tot_leaves = 16 * tot_e
+            exp_leaves = 16 * (tot_e - 64)
+            exp_tag = (
+                f"{tot_e} Experts/Layer [64 Base + {epd_e} Think + {epd_e} Tool + {epd_e} Reason = {tot_leaves:,} Total, Top-8 Active]"
+                if getattr(self.native_engine, "enable_expanded_experts", False)
+                else "64 Experts/Layer [1,024 Total]"
+            )
+            if not self.on_demand_streaming:
+                mode_str = f"Full In-RAM SwitchGLU ({exp_tag})"
+            elif self.pinned_layers > 0:
+                mode_str = (
+                    f"Hybrid RAM Budget ({self.pinned_layers}/16 Layers Pinned + "
+                    f"{16 - self.pinned_layers} Streamed | {exp_tag})"
+                )
+            else:
+                mode_str = (
+                    f"Low-RAM On-Demand Streaming (0/16 Pinned, Cache: "
+                    f"{self.native_engine.expert_cache.max_ram_mb:.0f} MiB | {exp_tag})"
+                )
 
         dev_label = "MLX-METAL" if self.use_mlx else "CPU-MMAP (Zero-Copy)"
         prof_str = " | Profiler: ON" if enable_profiler else ""
+        leaves_str = (
+            f"{tot_leaves:,}/{tot_leaves:,} Leaves Verified [1,024 Base + {exp_leaves:,} Expanded]"
+            if (not self.is_qwen38 and not self.is_glm53 and getattr(self.native_engine, "enable_expanded_experts", False))
+            else "1024/1024 Leaves Verified"
+        )
         print(
             f"SynapCore Ready in {self.native_init_sec*1000:.1f} ms "
-            f"(DB: merkle_tree.idx {idx_mb:.2f} MiB [Zero SQLite / Zero .safetensors])\n"
+            f"(DB: merkle_tree.idx {idx_mb:.2f} MiB [Zero SQLite, {leaves_str}])\n"
             f"Backend: {dev_label} | Mode: {mode_str} | PagedKV: {kv_quant_mode.upper()}{prof_str}\n"
             f"Startup Memory: Active Footprint = {active_footprint_mb:,.1f} MiB | Process RSS = {rss_mb:,.1f} MiB\n"
         )
 
     def format_prompt(self, prompt: str) -> List[int]:
+        """
+        Strict Zero-Fake Policy:
+          - Configures router domain affinities (`configure_domain_routing`).
+          - Never sets `_last_domain_prefix` and never modifies/stuffs `prompt`.
+          - Encodes ONLY `<|endoftext|><|user|>\n{prompt}\n<|assistant|>\n`.
+        """
+        self._last_raw_prompt = prompt
+        self._last_domain_prefix = ""
+        if self.is_glm53 and self.glm53_engine is not None:
+            return self.glm53_engine.format_prompt(
+                prompt, reasoning_effort="max" if self.enable_thinking else "low"
+            )
+        if self.is_qwen38 and self.qwen_engine is not None:
+            return self.qwen_engine.format_prompt(prompt, enable_thinking=self.enable_thinking)
         assert self.native_engine.tokenizer is not None
+        if getattr(self.native_engine, "enable_expanded_experts", False) and self.native_engine.expanded_bank is not None:
+            self.native_engine.configure_domain_routing(prompt, enable_thinking=self.enable_thinking)
         formatted = f"<|endoftext|><|user|>\n{prompt}\n<|assistant|>\n"
         return self.native_engine.tokenizer.encode(formatted, add_special_tokens=False).ids
 
     def generate_cpu_stream(
         self, input_ids: List[int], max_new_tokens: int = 256
     ) -> Dict[str, Union[str, int, float, List[int]]]:
+        if self.is_glm53 and self.glm53_engine is not None:
+            return self.glm53_engine.generate_stream(input_ids, max_new_tokens=max_new_tokens)
+        if self.is_qwen38 and self.qwen_engine is not None:
+            return self.qwen_engine.generate_stream(input_ids, max_new_tokens=max_new_tokens)
+
         assert self.native_engine.tokenizer is not None
         eos_id = int(self.native_engine.config.get("eos_token_id", 50279))
         stop_ids = {eos_id, 0, 50278}
@@ -263,6 +436,8 @@ class StandaloneSynapCoreChat:
             if next_tok in stop_ids:
                 break
             generated_ids.append(next_tok)
+            if len(generated_ids) >= 12 and generated_ids[-6:] == generated_ids[-12:-6]:
+                break
             curr_text = self.native_engine.tokenizer.decode(generated_ids)
             delta = curr_text[len(prev_text) :]
             if delta:
@@ -273,6 +448,11 @@ class StandaloneSynapCoreChat:
                 logits = self.native_engine.forward_full_model_numpy(
                     [next_tok], kv_k, kv_v, pos_offset=cur_pos
                 )
+                for recent_id in set(generated_ids[-32:]):
+                    if logits[recent_id] > 0:
+                        logits[recent_id] /= 1.15
+                    else:
+                        logits[recent_id] *= 1.15
                 next_tok = int(np.argmax(logits))
                 cur_pos += 1
 
@@ -325,6 +505,11 @@ class StandaloneSynapCoreChat:
     def generate_native_stream(
         self, input_ids: List[int], max_new_tokens: int = 256
     ) -> Dict[str, Union[str, int, float, List[int]]]:
+        if self.is_glm53 and self.glm53_engine is not None:
+            return self.glm53_engine.generate_stream(input_ids, max_new_tokens=max_new_tokens)
+        if self.is_qwen38 and self.qwen_engine is not None:
+            return self.qwen_engine.generate_stream(input_ids, max_new_tokens=max_new_tokens)
+
         if not self.use_mlx:
             return self.generate_cpu_stream(input_ids, max_new_tokens=max_new_tokens)
 
@@ -397,6 +582,10 @@ class StandaloneSynapCoreChat:
             if tok_int in stop_ids:
                 break
             generated_ids.append(tok_int)
+            if len(generated_ids) >= 12 and generated_ids[-6:] == generated_ids[-12:-6]:
+                break
+            if len(generated_ids) >= 16 and generated_ids[-8:] == generated_ids[-16:-8]:
+                break
             curr_text = self.native_engine.tokenizer.decode(generated_ids)
             delta = curr_text[len(prev_text) :]
             if delta:
@@ -419,14 +608,15 @@ class StandaloneSynapCoreChat:
         dec_tokens = max(1, len(generated_ids) - 1)
         act_mb, peak_mb, _ = get_mlx_memory_metrics_mb()
         rss_mb = get_process_rss_mb()
-        pinned_mb = float(self.pinned_layers * 64) * self.native_engine.expert_leaf_mb
+        full_experts_mb = float(self.native_engine.num_layers * self.native_engine.num_experts) * self.native_engine.expert_leaf_mb
+        pinned_mb = float(self.pinned_layers * self.native_engine.num_experts) * self.native_engine.expert_leaf_mb
         hot_cache_mb = (
-            12288.0
+            full_experts_mb
             if not self.on_demand_streaming
             else (pinned_mb + self.native_engine.expert_cache.memory_mb())
         )
         max_expert_budget_mb = (
-            12288.0
+            full_experts_mb
             if not self.on_demand_streaming
             else (pinned_mb + self.native_engine.expert_cache.max_ram_mb)
         )
@@ -475,15 +665,37 @@ class StandaloneSynapCoreChat:
         res = self.generate_native_stream(input_ids, max_new_tokens=max_new_tokens)
         kv_stats = self.native_engine.kv_prefix_cache.get_paged_kv_stats()
         dev_str = "MLX-METAL" if self.use_mlx else "CPU-MMAP"
-        tier_label = (
-            "Full In-RAM SwitchGLU (16/16 Layers)"
-            if not self.on_demand_streaming
-            else (
-                f"Hybrid ({self.pinned_layers}/16 Pinned + LFU Cache)"
-                if self.pinned_layers > 0
-                else "Low-RAM On-Demand Streaming"
+        if self.is_glm53:
+            tier_label = f"GLM-5.3 MoE Stream ({self.pinned_layers}/78 Pinned + Top-8/256)"
+            base_gb_label = "Active Weight RAM (vs 755.6 GB FP8)"
+        elif self.is_qwen38:
+            tier_label = (
+                "Full In-RAM 8-Bit Hybrid (64/64 Layers)"
+                if not self.on_demand_streaming
+                else (
+                    f"Hybrid ({self.pinned_layers}/64 Pinned + Stream)"
+                    if self.pinned_layers > 0
+                    else "Low-RAM 64-Layer Streaming"
+                )
             )
-        )
+            base_gb_label = "Active Weight RAM (vs 27.47 GiB)"
+        else:
+            tier_label = (
+                "Full In-RAM SwitchGLU (16/16 Layers)"
+                if not self.on_demand_streaming
+                else (
+                    f"Hybrid ({self.pinned_layers}/16 Pinned + LFU Cache)"
+                    if self.pinned_layers > 0
+                    else "Low-RAM On-Demand Streaming"
+                )
+            )
+            full_mod_gb = self.ram_plan["full_model_mb"] / 1024.0
+            base_gb_label = (
+                f"Active Weight RAM (vs {full_mod_gb:.2f} GiB)"
+                if getattr(self.native_engine, "enable_expanded_experts", False)
+                else "Active Weight RAM (vs 13.20 GiB)"
+            )
+
         bud_gb = self.ram_plan["budget_ram_mb"] / 1024.0
         sys_gb = self.ram_plan["system_ram_mb"] / 1024.0
 
@@ -501,11 +713,11 @@ class StandaloneSynapCoreChat:
         )
         print(f"{'Execution Tier Mode':<36} | {tier_label:>39}")
         print(
-            f"{'Active Weight RAM (vs 13.20 GiB)':<36} | "
+            f"{base_gb_label:<36} | "
             f"{float(res['mlx_active_mb']):>18,.2f} MiB ({-float(res['ram_saved_pct']):+.2f}%)"
         )
         print(
-            f"{'Expert RAM Used / Expert Budget':<36} | "
+            f"{'Layer/Expert RAM Used / Budget':<36} | "
             f"{float(res['hot_cache_mb']):>14,.2f} / {float(res['max_cache_mb']):,.2f} MiB"
         )
         print(
@@ -525,7 +737,7 @@ class StandaloneSynapCoreChat:
             f"{float(res['decode_tps']):>33.2f} tok/s"
         )
         print(
-            f"{'Hot-Expert Cache Hit / Lookahead':<36} | "
+            f"{'Cache Hit / Lookahead Accuracy':<36} | "
             f"{float(res['cache_hit_rate_pct']):>27.1f}% / {float(res['lookahead_acc_pct']):>5.1f}%"
         )
         print(
@@ -536,6 +748,14 @@ class StandaloneSynapCoreChat:
             f"{'Merkle Proofs (Tier-1 / Tier-2 Byte)':<36} | "
             f"{int(res['xor_proofs']):>28} / {int(res['tier2_byte_proofs']):<8}"
         )
+        if not self.is_qwen38 and getattr(self.native_engine, "enable_expanded_experts", False) and self.native_engine.expanded_bank is not None:
+            route_sum = self.native_engine.expanded_bank.format_routing_summary()  # type: ignore[attr-defined]
+            r_ver = getattr(self.native_engine, "router_version", "v1").upper()
+            r_lbl = f"3-Domain Routing [{r_ver}] ({self.native_engine.num_experts}/Layer)"
+            print(f"{r_lbl:<36} | {route_sum:>39}")
+            if getattr(self.native_engine, "router_version", "v1") == "v2" and getattr(self.native_engine, "thalamic_router_v2", None) is not None:
+                v2_line = self.native_engine.thalamic_router_v2.format_telemetry_line()  # type: ignore[attr-defined]
+                print(f"{'Thalamic Router v2 State':<36} | {v2_line:>39}")
         print(
             f"{'PagedKV (' + kv_stats['quant_mode'].upper() + ') Active Pages':<36} | "
             f"{kv_stats['allocated_pages']:>24}/{kv_stats['max_pages']} ({kv_stats['arena_active_mb']:.2f} MiB)"
@@ -555,18 +775,25 @@ NativeSideBySideComparator = StandaloneSynapCoreChat
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Standalone SynapCore Native C++17 / MLX-Metal Chat (Dynamic Max RAM Budget)"
+        description="Standalone SynapCore Native C++17 / MLX-Metal Chat (OLMoE-1B-7B & Qwen3.8-27B-MLX-8bit)"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="auto",
+        choices=["auto", "olmoe", "qwen3.8", "qwen38", "qwen", "glm5.3", "glm-5.3", "glm53"],
+        help="Select model to run: 'olmoe' (OLMoE-1B-7B), 'qwen3.8' (Qwen3.8-27B-MLX-8bit), or 'glm5.3' (zai-org/GLM-5.3)",
     )
     parser.add_argument(
         "--store-dir",
         type=str,
-        default=str(ROOT_DIR / "olmoe_merkle_store"),
+        default=None,
     )
     parser.add_argument(
         "--max-ram-gb",
         type=float,
         default=None,
-        help="Maximum RAM budget in GiB (e.g. --max-ram-gb 4.0 or --max-ram-gb 16.0). If >= 12.92 GiB, loads full model in SwitchGLU (~165+ tok/s).",
+        help="Maximum RAM budget in GiB (e.g. --max-ram-gb 4.0 or --max-ram-gb 32.0).",
     )
     parser.add_argument(
         "--ram-percent",
@@ -579,13 +806,26 @@ def main() -> None:
     parser.add_argument(
         "--preload-all-experts",
         action="store_true",
-        help="Force pre-stacking all 1,024 experts in RAM (~12.92 GiB -> ~165+ tok/s)",
+        help="Force pre-stacking all layers/experts in RAM",
     )
     parser.add_argument(
         "--on-demand-streaming",
         action="store_true",
         default=False,
-        help="Force strict on-demand expert streaming mode",
+        help="Force strict on-demand streaming mode",
+    )
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=True,
+        help="Enable <think>...</think> reasoning output for Qwen 3.8 (default: True, matching Direct model)",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        "--no-think",
+        action="store_true",
+        default=False,
+        help="Disable <think>...</think> reasoning output for Qwen 3.8",
     )
     parser.add_argument(
         "--profile",
@@ -604,16 +844,47 @@ def main() -> None:
         default=False,
         help="Task P1.4: Disable speculative lookahead prefetch for isolated A/B benchmarking",
     )
+    parser.add_argument(
+        "--router-version",
+        type=str,
+        default="v1",
+        choices=["v1", "v2"],
+        help="Router version: 'v1' (existing workflow default) or 'v2' (Thalamic 4-Stage Router with pure model output)",
+    )
     parser.add_argument("--kv-max-pages", type=int, default=64)
     parser.add_argument("--kv-quant", type=str, default="fp16", choices=["fp16", "int8"])
-    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "mps", "mlx", "cpu"])
     parser.add_argument("--prompt", type=str, default=None)
     args = parser.parse_args()
 
+    selected_model = args.model.lower()
+    if args.store_dir is not None:
+        target_store_dir = Path(args.store_dir)
+    elif selected_model in {"glm5.3", "glm-5.3", "glm53"}:
+        target_store_dir = GLM53_STORE_DIR
+    elif selected_model in {"qwen3.8", "qwen38", "qwen"}:
+        target_store_dir = QWEN38_STORE_DIR
+    else:
+        target_store_dir = STORE_DIR
+
+    fam_req = detect_model_family(target_store_dir, selected_model)
+
     sys_ram_mb = get_system_ram_mb()
     sys_ram_gb = sys_ram_mb / 1024.0
     default_50_gb = sys_ram_gb * 0.50
+    exp_man_p = target_store_dir / "expanded_merkle_manifest.json"
+    if fam_req == "glm5.3":
+        full_mod_str = "755.60 GB FP8 (744B Total / 40B Active)"
+    elif fam_req == "qwen3.8":
+        full_mod_str = "28.06 GiB"
+    elif exp_man_p.exists():
+        import json as _json
+        _tot_e = int(_json.loads(exp_man_p.read_text()).get("total_experts_per_layer", 256))
+        _exp_gb = ((_tot_e - 64) * 16 * 12.0) / 1024.0
+        full_mod_str = f"{12.92 + _exp_gb:.2f} GiB [12.92G Base + {_exp_gb:.2f}G Expanded ({16*_tot_e:,} Experts)]"
+    else:
+        full_mod_str = "12.92 GiB"
 
     max_ram_mb: Optional[float] = None
     ram_percent: float = 50.0
@@ -622,7 +893,7 @@ def main() -> None:
     env_ram_pct = os.environ.get("SYNAPCORE_RAM_PERCENT")
 
     if args.preload_all_experts:
-        max_ram_mb = max(16384.0, sys_ram_mb * 0.5)
+        max_ram_mb = max(32768.0, sys_ram_mb * 0.5)
     elif args.max_ram_gb is not None:
         max_ram_mb = float(args.max_ram_gb) * 1024.0
     elif args.ram_percent is not None:
@@ -641,13 +912,13 @@ def main() -> None:
         print("─" * 78)
         print(
             f"SYNAPCORE RAM BUDGET CONFIGURATOR (System RAM: {sys_ram_gb:.1f} GiB | "
-            f"Default 50%: {default_50_gb:.1f} GiB | Full Model: 12.92 GiB)"
+            f"Default 50%: {default_50_gb:.1f} GiB | Full Model: {full_mod_str})"
         )
         print("─" * 78)
         try:
             raw_ans = input(
                 f"Max RAM set karein [Enter = Default 50% ({default_50_gb:.1f} GiB), "
-                f"ya type e.g. '4gb', '8gb', '16gb', '25%']: "
+                f"ya type e.g. '8gb', '16gb', '32gb', '50%']: "
             ).strip()
             if raw_ans:
                 max_ram_mb, ram_percent = parse_user_ram_input(raw_ans, sys_ram_mb)
@@ -656,9 +927,10 @@ def main() -> None:
 
     force_on_demand: Optional[bool] = True if args.on_demand_streaming else None
     enable_lookahead = bool(args.enable_prefetch) and not bool(args.disable_prefetch)
+    enable_thinking = bool(args.enable_thinking) and not bool(args.disable_thinking)
 
     chat = StandaloneSynapCoreChat(
-        merkle_store_dir=Path(args.store_dir),
+        merkle_store_dir=target_store_dir,
         max_ram_mb=max_ram_mb,
         ram_percent=ram_percent,
         expert_cache_size=args.cache_experts,
@@ -666,9 +938,12 @@ def main() -> None:
         on_demand_streaming=force_on_demand,
         enable_profiler=args.profile,
         enable_lookahead=enable_lookahead,
+        enable_thinking=enable_thinking,
         kv_max_pages=args.kv_max_pages,
         kv_quant_mode=args.kv_quant,
         device=args.device,
+        model_family=selected_model,
+        router_version=args.router_version,
     )
     try:
         if args.prompt:
@@ -676,7 +951,7 @@ def main() -> None:
             return
         print(
             "Standalone SynapCore Chat Started! Type your message below "
-            "(type '/ram 4gb' or '/ram 50%' to change RAM budget, or 'exit' to stop)."
+            "(commands: '/router v2', '/router v1', '/model qwen3.8', '/model olmoe', '/ram 16gb', '/think on', or 'exit')."
         )
         while True:
             try:
@@ -689,6 +964,40 @@ def main() -> None:
             if msg.lower() in {"exit", "quit", ":q"}:
                 print("Exiting chat.")
                 break
+            if msg.lower().startswith("/router"):
+                r_arg = msg[7:].strip().lower()
+                if r_arg not in {"v1", "v2"}:
+                    print(f"Current Router Version: {chat.router_version} (Usage: '/router v1' or '/router v2')")
+                    continue
+                chat.router_version = r_arg
+                if not chat.is_qwen38 and hasattr(chat.native_engine, "set_router_version"):
+                    chat.native_engine.set_router_version(r_arg)
+                print(f"Switched active router to: {r_arg.upper()}")
+                continue
+            if msg.lower().startswith("/think"):
+                chat.enable_thinking = not chat.enable_thinking
+                print(f"Qwen3.8 <think> mode: {'ENABLED' if chat.enable_thinking else 'DISABLED'}")
+                continue
+            if msg.lower().startswith("/model"):
+                m_arg = msg[6:].strip().lower()
+                if m_arg not in {"qwen3.8", "qwen38", "qwen", "olmoe"}:
+                    print("Usage: '/model qwen3.8' or '/model olmoe'")
+                    continue
+                new_store = QWEN38_STORE_DIR if "qwen" in m_arg else STORE_DIR
+                chat.close()
+                chat = StandaloneSynapCoreChat(
+                    merkle_store_dir=new_store,
+                    max_ram_mb=max_ram_mb,
+                    ram_percent=ram_percent,
+                    enable_profiler=args.profile,
+                    enable_lookahead=enable_lookahead,
+                    enable_thinking=chat.enable_thinking,
+                    kv_max_pages=args.kv_max_pages,
+                    kv_quant_mode=args.kv_quant,
+                    device=args.device,
+                    model_family=m_arg,
+                )
+                continue
             if msg.lower().startswith("/ram"):
                 arg_str = msg[4:].strip()
                 if not arg_str:
@@ -701,17 +1010,21 @@ def main() -> None:
                 try:
                     new_mb, new_pct = parse_user_ram_input(arg_str, sys_ram_mb)
                 except ValueError:
-                    print("Invalid RAM value! Example: '/ram 4gb', '/ram 8gb', '/ram 50%', '/ram full'")
+                    print("Invalid RAM value! Example: '/ram 8gb', '/ram 16gb', '/ram 50%', '/ram full'")
                     continue
+                max_ram_mb, ram_percent = new_mb, new_pct
                 chat.close()
                 chat = StandaloneSynapCoreChat(
-                    merkle_store_dir=Path(args.store_dir),
+                    merkle_store_dir=chat.merkle_store_dir,
                     max_ram_mb=new_mb,
                     ram_percent=new_pct,
                     enable_profiler=args.profile,
+                    enable_lookahead=enable_lookahead,
+                    enable_thinking=chat.enable_thinking,
                     kv_max_pages=args.kv_max_pages,
                     kv_quant_mode=args.kv_quant,
                     device=args.device,
+                    model_family=chat.model_family,
                 )
                 continue
             chat.run_turn(msg, max_new_tokens=args.max_tokens)

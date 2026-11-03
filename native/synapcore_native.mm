@@ -152,7 +152,7 @@ struct SynapCoreNativeContext {
     std::condition_variable  prefetch_done_cv;
     std::queue<PrefetchTask> prefetch_queue;
     std::atomic<uint32_t>    active_prefetches{0};
-    std::atomic<uint64_t>    paged_in_bitmap[16];
+    std::atomic<uint64_t>    paged_in_bitmap[64];
     std::atomic<bool>        stop_worker{false};
     std::atomic<uint64_t>    step_clock{0};
     std::atomic<uint64_t>    prefetch_issued{0};
@@ -164,7 +164,7 @@ struct SynapCoreNativeContext {
     std::atomic<uint64_t>    byte_proofs_verified{0};
 
     SynapCoreNativeContext() {
-        for (int i = 0; i < 16; ++i) {
+        for (int i = 0; i < 64; ++i) {
             paged_in_bitmap[i].store(0ULL, std::memory_order_relaxed);
         }
     }
@@ -235,6 +235,8 @@ static void convert_fp16_to_fp32_vec(const uint16_t* src_fp16, float* dst_f32, s
 // ============================================================================
 static void prefetch_worker_loop(SynapCoreNativeContext* ctx) {
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const int n_layers = static_cast<int>(ctx->header->num_layers);
+    const int n_experts = static_cast<int>(ctx->header->num_experts);
     while (!ctx->stop_worker.load(std::memory_order_relaxed)) {
         PrefetchTask task;
         {
@@ -249,13 +251,13 @@ static void prefetch_worker_loop(SynapCoreNativeContext* ctx) {
             ctx->prefetch_queue.pop();
             ctx->active_prefetches.fetch_add(1, std::memory_order_relaxed);
         }
-        if (task.layer_idx >= 0 && task.layer_idx < 16 && task.expert_idx >= 0 && task.expert_idx < 64) {
+        if (task.layer_idx >= 0 && task.layer_idx < n_layers && task.expert_idx >= 0 && task.expert_idx < n_experts) {
             const uint64_t bit_mask = (1ULL << static_cast<uint32_t>(task.expert_idx));
             const uint64_t prev_bits = ctx->paged_in_bitmap[task.layer_idx].fetch_or(bit_mask, std::memory_order_relaxed);
             if ((prev_bits & bit_mask) != 0ULL) {
                 ctx->prefetch_skipped_dup.fetch_add(1, std::memory_order_relaxed);
             } else {
-                const uint32_t slot = (static_cast<uint32_t>(task.layer_idx) << 6) | static_cast<uint32_t>(task.expert_idx);
+                const uint32_t slot = static_cast<uint32_t>(task.layer_idx) * static_cast<uint32_t>(n_experts) + static_cast<uint32_t>(task.expert_idx);
                 NativeExpertEntry& e = ctx->experts[slot];
                 if ((e.flags & SYNAPCORE_FLAG_IS_COW) == 0u && ctx->cas_mmap != nullptr) {
                     size_t start = static_cast<size_t>(e.byte_offset) & ~(page_size - 1);
@@ -329,7 +331,8 @@ int synapcore_native_verify_tier1_structure(void* handle) {
     if (!ctx->header || std::memcmp(ctx->header->magic, "SYNPIDX1", 8) != 0 || ctx->header->version != 1u) {
         return SYNAPCORE_ERR_MERKLE_CORRUPT;
     }
-    if (ctx->header->num_layers != 16u || ctx->header->num_experts != 64u) {
+    if ((ctx->header->num_layers * ctx->header->num_experts) != 1024u ||
+        ctx->header->num_layers > 64u || ctx->header->num_experts > 64u) {
         return SYNAPCORE_ERR_MERKLE_CORRUPT;
     }
 
@@ -530,11 +533,16 @@ int synapcore_native_lookup_expert(
     uint32_t* out_flags,
     uint8_t*  out_sha256_32
 ) {
-    if (!handle || layer_idx < 0 || layer_idx >= 16 || expert_idx < 0 || expert_idx >= 64) {
+    if (!handle) {
         return SYNAPCORE_ERR_INVALID_ARG;
     }
     auto* ctx = static_cast<SynapCoreNativeContext*>(handle);
-    const uint32_t slot = (static_cast<uint32_t>(layer_idx) << 6) | static_cast<uint32_t>(expert_idx);
+    const int n_layers = static_cast<int>(ctx->header->num_layers);
+    const int n_experts = static_cast<int>(ctx->header->num_experts);
+    if (layer_idx < 0 || layer_idx >= n_layers || expert_idx < 0 || expert_idx >= n_experts) {
+        return SYNAPCORE_ERR_INVALID_ARG;
+    }
+    const uint32_t slot = static_cast<uint32_t>(layer_idx) * static_cast<uint32_t>(n_experts) + static_cast<uint32_t>(expert_idx);
     NativeExpertEntry& entry = ctx->experts[slot];
 
     uint64_t step = ctx->step_clock.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -554,11 +562,16 @@ int synapcore_native_lookup_expert(
 }
 
 int synapcore_native_verify_expert_xor_merkle(void* handle, int layer_idx, int expert_idx, int verify_leaf_bytes) {
-    if (!handle || layer_idx < 0 || layer_idx >= 16 || expert_idx < 0 || expert_idx >= 64) {
+    if (!handle) {
         return SYNAPCORE_ERR_INVALID_ARG;
     }
     auto* ctx = static_cast<SynapCoreNativeContext*>(handle);
-    const uint32_t slot = (static_cast<uint32_t>(layer_idx) << 6) | static_cast<uint32_t>(expert_idx);
+    const int n_layers = static_cast<int>(ctx->header->num_layers);
+    const int n_experts = static_cast<int>(ctx->header->num_experts);
+    if (layer_idx < 0 || layer_idx >= n_layers || expert_idx < 0 || expert_idx >= n_experts) {
+        return SYNAPCORE_ERR_INVALID_ARG;
+    }
+    const uint32_t slot = static_cast<uint32_t>(layer_idx) * static_cast<uint32_t>(n_experts) + static_cast<uint32_t>(expert_idx);
     NativeExpertEntry& entry = ctx->experts[slot];
 
     uint8_t curr_hash[32];
@@ -641,10 +654,15 @@ void synapcore_native_flush_prefetch_queue(void* handle) {
 }
 
 int synapcore_native_evict_expert(void* handle, int layer_idx, int expert_idx) {
-    if (!handle || layer_idx < 0 || layer_idx >= 16 || expert_idx < 0 || expert_idx >= 64) {
+    if (!handle) {
         return SYNAPCORE_ERR_INVALID_ARG;
     }
     auto* ctx = static_cast<SynapCoreNativeContext*>(handle);
+    const int n_layers = static_cast<int>(ctx->header->num_layers);
+    const int n_experts = static_cast<int>(ctx->header->num_experts);
+    if (layer_idx < 0 || layer_idx >= n_layers || expert_idx < 0 || expert_idx >= n_experts) {
+        return SYNAPCORE_ERR_INVALID_ARG;
+    }
     if (!ctx->cas_mmap) {
         return SYNAPCORE_ERR_BOUNDS;
     }
@@ -652,7 +670,7 @@ int synapcore_native_evict_expert(void* handle, int layer_idx, int expert_idx) {
     ctx->paged_in_bitmap[layer_idx].fetch_and(clear_mask, std::memory_order_relaxed);
 
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    const uint32_t slot = (static_cast<uint32_t>(layer_idx) << 6) | static_cast<uint32_t>(expert_idx);
+    const uint32_t slot = static_cast<uint32_t>(layer_idx) * static_cast<uint32_t>(n_experts) + static_cast<uint32_t>(expert_idx);
     const NativeExpertEntry& e = ctx->experts[slot];
     if ((e.flags & SYNAPCORE_FLAG_IS_COW) == 0u) {
         size_t start = static_cast<size_t>(e.byte_offset) & ~(page_size - 1);
@@ -825,7 +843,12 @@ public:
     const char* backend_name() const override { return name_.c_str(); }
 
     int dma_stage_expert(uint32_t sram_slot, int layer_idx, int expert_idx) override {
-        if (!ctx_ || sram_slot >= sram_capacity_ || layer_idx < 0 || layer_idx >= 16 || expert_idx < 0 || expert_idx >= 64) {
+        if (!ctx_ || sram_slot >= sram_capacity_) {
+            return SYNAPCORE_ERR_INVALID_ARG;
+        }
+        const int n_layers  = static_cast<int>(ctx_->header->num_layers);
+        const int n_experts = static_cast<int>(ctx_->header->num_experts);
+        if (layer_idx < 0 || layer_idx >= n_layers || expert_idx < 0 || expert_idx >= n_experts) {
             return SYNAPCORE_ERR_INVALID_ARG;
         }
         uint64_t byte_off = 0;
@@ -999,7 +1022,8 @@ public:
 
         // If gate/up/down pointers are null, slice directly from zero-copy `cas_mmap` using `desc.layer_idx` & `desc.expert_idx`
         if ((!gate_w_fp16 || !up_w_fp16 || !down_w_fp16) && ctx_ != nullptr && ctx_->cas_mmap != nullptr) {
-            const uint32_t slot = (desc.layer_idx << 6) | (desc.expert_idx & 63u);
+            const uint32_t n_exp = ctx_->header->num_experts;
+            const uint32_t slot = (desc.layer_idx * n_exp) + (desc.expert_idx % n_exp);
             const NativeExpertEntry& ent = ctx_->experts[slot];
             const uint8_t* base = ((ent.flags & SYNAPCORE_FLAG_IS_COW) != 0u && ctx_->cow_mmap != nullptr)
                                       ? (ctx_->cow_mmap + ent.byte_offset)
@@ -1435,11 +1459,15 @@ int main(int argc, char** argv) {
     }
 
     if (argc >= 3 && std::string(argv[2]) == "--full-scan") {
-        std::printf("[Full-Scan] Running Tier-2 ARMv8 CC_SHA256 Byte Verification across all 1,024 leaves (12.00 GiB)...\n");
+        auto* ctx = static_cast<SynapCoreNativeContext*>(handle);
+        const int n_layers  = static_cast<int>(ctx->header->num_layers);
+        const int n_experts = static_cast<int>(ctx->header->num_experts);
+        const double total_gb = (1024.0 * static_cast<double>(ctx->header->expert_leaf_bytes)) / (1024.0 * 1024.0 * 1024.0);
+        std::printf("[Full-Scan] Running Tier-2 ARMv8 CC_SHA256 Byte Verification across all 1,024 leaves (%.2f GiB)...\n", total_gb);
         auto t_s0 = std::chrono::high_resolution_clock::now();
         int verified_count = 0;
-        for (int l_i = 0; l_i < 16; ++l_i) {
-            for (int e_i = 0; e_i < 64; ++e_i) {
+        for (int l_i = 0; l_i < n_layers; ++l_i) {
+            for (int e_i = 0; e_i < n_experts; ++e_i) {
                 int rc = synapcore_native_verify_expert_xor_merkle(handle, l_i, e_i, 1);
                 if (rc != 1) {
                     std::cerr << "[ERR_MERKLE_CORRUPT] Corrupted expert detected at L" << l_i << "E" << e_i << "!\n";
@@ -1451,14 +1479,18 @@ int main(int argc, char** argv) {
         }
         auto t_s1 = std::chrono::high_resolution_clock::now();
         double scan_sec = std::chrono::duration<double>(t_s1 - t_s0).count();
-        double gb_per_s = 12.0 / std::max(1e-6, scan_sec);
+        double gb_per_s = total_gb / std::max(1e-6, scan_sec);
         synapcore_native_close(handle);
-        std::printf("[Full-Scan] Verified %d/1024 leaves (12.00 GiB) in %.2fs (%.2f GiB/s)\n",
-                    verified_count, scan_sec, gb_per_s);
+        std::printf("[Full-Scan] Verified %d/1024 leaves (%.2f GiB) in %.2fs (%.2f GiB/s)\n",
+                    verified_count, total_gb, scan_sec, gb_per_s);
         return 0;
     }
 
     double sql_ms = (argc >= 3) ? std::atof(argv[2]) : 0.0;
+
+    auto* ctx_main = static_cast<SynapCoreNativeContext*>(handle);
+    const int n_layers_main  = static_cast<int>(ctx_main->header->num_layers);
+    const int n_experts_main = static_cast<int>(ctx_main->header->num_experts);
 
     int zc_metal = 0;
     uint64_t pref_cnt = 0, xor_cnt = 0, idx_bytes = 0;
@@ -1468,15 +1500,15 @@ int main(int argc, char** argv) {
     uint32_t len_out = 0, flg_out = 0;
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 10000; ++i) {
-        synapcore_native_lookup_expert(handle, i & 15, i & 63, &off_out, &len_out, &flg_out, nullptr);
+        synapcore_native_lookup_expert(handle, i % n_layers_main, i % n_experts_main, &off_out, &len_out, &flg_out, nullptr);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     double nat_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     auto t2 = std::chrono::high_resolution_clock::now();
     int verified_all = 0;
-    for (int l_i = 0; l_i < 16; ++l_i) {
-        for (int e_i = 0; e_i < 64; ++e_i) {
+    for (int l_i = 0; l_i < n_layers_main; ++l_i) {
+        for (int e_i = 0; e_i < n_experts_main; ++e_i) {
             if (synapcore_native_verify_expert_xor_merkle(handle, l_i, e_i, 0) == 1) {
                 verified_all += 1;
             }
@@ -1486,12 +1518,19 @@ int main(int argc, char** argv) {
     double xor_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
     auto t4 = std::chrono::high_resolution_clock::now();
-    int ok_l6e7 = (synapcore_native_verify_expert_xor_merkle(handle, 6, 7, 1) == 1);
+    int ok_l6e7 = (synapcore_native_verify_expert_xor_merkle(handle, std::min(6, n_layers_main - 1), std::min(7, n_experts_main - 1), 1) == 1);
     auto t5 = std::chrono::high_resolution_clock::now();
     double full_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
 
-    int test_exps[6] = {2, 11, 25, 33, 48, 62};
-    synapcore_native_prefetch_experts(handle, 1, test_exps, 6);
+    int test_exps[6] = {
+        2 % n_experts_main,
+        11 % n_experts_main,
+        25 % n_experts_main,
+        33 % n_experts_main,
+        48 % n_experts_main,
+        62 % n_experts_main
+    };
+    synapcore_native_prefetch_experts(handle, 1 % n_layers_main, test_exps, 6);
     synapcore_native_flush_prefetch_queue(handle);
     synapcore_native_get_stats(handle, &zc_metal, &pref_cnt, &xor_cnt, &idx_bytes);
 

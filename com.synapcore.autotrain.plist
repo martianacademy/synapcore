@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.synapcore.autotrain</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/suru.martian/Documents/merkle-moe/native/auto_daily_trainer_daemon.py</string>
+        <string>--mode</string>
+        <string>daemon</string>
+        <string>--daily-limit-gb</string>
+        <string>5.0</string>
+        <string>--poll-interval</string>
+        <string>30</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/suru.martian/Documents/merkle-moe</string>
+    <key>KeepAlive</key>
+    <dict>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/suru.martian/Documents/merkle-moe/olmoe_merkle_store/datasets/auto_trainer_daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/suru.martian/Documents/merkle-moe/olmoe_merkle_store/datasets/auto_trainer_daemon.log</string>
+</dict>
+</plist>

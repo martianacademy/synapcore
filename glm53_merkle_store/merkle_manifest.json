@@ -1,0 +1,30 @@
+{
+  "model_name": "zai-org/GLM-5.3",
+  "model_type": "glm_moe_dsa",
+  "architecture": "GlmMoeDsaForCausalLM",
+  "quantization": {
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+  "num_layers": 78,
+  "first_k_dense_replace": 3,
+  "num_sparse_moe_layers": 75,
+  "n_routed_experts": 256,
+  "n_shared_experts": 1,
+  "num_experts_per_tok": 8,
+  "total_routed_experts": 19200,
+  "hidden_size": 6144,
+  "moe_intermediate_size": 2048,
+  "dense_intermediate_size": 12288,
+  "vocab_size": 154880,
+  "orig_safetensors_total_bytes": 755600000000,
+  "model_merkle_root": "11ddcc2a694cc4cff6f0c28404b86e349d97141f71228b97a7e51495ff130e42",
+  "embedding_trie_root": "c30efa62ea760bfb5694977922893e08df3ebcf136f8c7dc65887d53634fde40",
+  "shared_core_root": "6348600801c3e0644ee595274aeae6faf09631039abb78aa33c5a525882ce66b",
+  "expert_tree_root": "f5436d51b21eb16d7d7e094b092c94f70382402d8db0846a4fcb04d5c3f65933",
+  "output_head_root": "6df663ae1c3056f29840fa6a7a768a4354638829e32cf22bb21696587c143c92"
+}

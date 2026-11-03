@@ -690,10 +690,36 @@ def resolve_ram_budget_plan(
 
 
 def get_process_rss_mb() -> float:
-    """Returns peak resident set size (`ru_maxrss`) in MiB (bytes on macOS, KiB on Linux)."""
-    raw_rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    """Returns current live resident set size (`resident_size`) in MiB on macOS (fallback `ru_maxrss`)."""
     if sys.platform == "darwin":
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+
+            class MachTaskBasicInfo(ctypes.Structure):
+                _fields_ = [
+                    ("virtual_size", ctypes.c_uint64),
+                    ("resident_size", ctypes.c_uint64),
+                    ("resident_size_max", ctypes.c_uint64),
+                    ("user_time", ctypes.c_uint64),
+                    ("system_time", ctypes.c_uint64),
+                    ("policy", ctypes.c_int32),
+                    ("suspend_count", ctypes.c_int32),
+                ]
+
+            info = MachTaskBasicInfo()
+            count = ctypes.c_uint32(ctypes.sizeof(info) // ctypes.sizeof(ctypes.c_uint32))
+            kr = libc.task_info(
+                libc.mach_task_self(), 20, ctypes.byref(info), ctypes.byref(count)
+            )
+            if kr == 0 and info.resident_size > 0:
+                return float(info.resident_size) / (1024.0 * 1024.0)
+        except Exception:
+            pass
+        raw_rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
         return raw_rss / (1024.0 * 1024.0)
+    raw_rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     return raw_rss / 1024.0
 
 
@@ -1470,9 +1496,11 @@ class NativeMmapIndexBridge:
         force: bool = False,
         preloaded_buf: Optional[Union[bytes, bytearray, memoryview]] = None,
     ) -> bool:
-        if not (0 <= layer_idx < 16 and 0 <= expert_idx < 64):
+        n_layers = int(self.num_layers)
+        n_experts = int(self.num_experts)
+        if not (0 <= layer_idx < n_layers and 0 <= expert_idx < n_experts):
             raise MerkleIntegrityError(f"Invalid expert coordinates L{layer_idx}E{expert_idx}!")
-        slot = (layer_idx << 6) | expert_idx
+        slot = layer_idx * n_experts + expert_idx
         with self.idx_lock:
             if (not force) and (slot in self.verified_leaf_slots):
                 return True
@@ -1547,7 +1575,7 @@ class NativeMmapIndexBridge:
             return True
 
     def lookup_expert(self, layer_idx: int, expert_idx: int) -> Tuple[str, int, int, bool]:
-        slot = (layer_idx << 6) | expert_idx
+        slot = layer_idx * int(self.num_experts) + expert_idx
         off_pos = OFFSET_EXPERT_TBL + (slot * 64)
         with self.idx_lock:
             sha_bytes, byte_off, byte_len, flags, _, _ = _EXPERT_STRUCT.unpack_from(self.idx_mmap, off_pos)
@@ -1626,7 +1654,7 @@ class NativeMmapIndexBridge:
     def prefetch_cold_expert(
         self, layer_idx: int, expert_idx: int, byte_off: int, byte_len: int, skip_mmap_touch: bool = False
     ) -> None:
-        slot = (layer_idx << 6) | expert_idx
+        slot = layer_idx * int(self.num_experts) + expert_idx
         with self.idx_lock:
             if slot in self.paged_in_slots:
                 return
@@ -1636,7 +1664,7 @@ class NativeMmapIndexBridge:
             madvise_range(self.cas_mmap, byte_off, byte_len, MADV_WILLNEED)
 
     def evict_expert_slot(self, layer_idx: int, expert_idx: int, byte_off: int, byte_len: int) -> bool:
-        slot = (layer_idx << 6) | expert_idx
+        slot = layer_idx * int(self.num_experts) + expert_idx
         with self.idx_lock:
             self.paged_in_slots.discard(slot)
             released = madvise_range(self.cas_mmap, byte_off, byte_len, MADV_DONTNEED)
@@ -1812,6 +1840,49 @@ if HAS_MLX_METAL:
 
             return mx.stack(token_outputs, axis=0)
 
+    class SynapCoreHybridExpandedMoEMLP(nn.Module):
+        """
+        Fast Hybrid 256-Expert MLP: executes Base Experts (0..63) via pinned Metal SwitchGLU
+        and streams Expanded Domain Experts (64..255) zero-copy from `cas_expanded_experts.bin`!
+        """
+
+        def __init__(self, engine: NativeMerkleMoEEngine, layer_idx: int, base_switch_mlp: SwitchGLU):
+            super().__init__()
+            self.engine: NativeMerkleMoEEngine = engine
+            self.layer_idx: int = layer_idx
+            self.base_switch_mlp: SwitchGLU = base_switch_mlp
+
+        def __call__(self, x_flat: mx.array, indices: mx.array) -> mx.array:
+            mx.eval(indices)
+            ind_np = np.array(indices, dtype=np.int32)
+            self.engine.live_routing_buffer.record_numpy_layer(self.layer_idx, ind_np)
+            if self.engine.enable_expanded_experts and self.engine.expanded_bank is not None:
+                self.engine.expanded_bank.record_routed_experts(ind_np)  # type: ignore[attr-defined]
+
+            base_limit = self.engine.base_num_experts
+            if int(np.max(ind_np)) < base_limit:
+                return self.base_switch_mlp(x_flat, indices)
+
+            safe_ind_np = np.where(ind_np < base_limit, ind_np, 0).astype(np.int32)
+            base_out = self.base_switch_mlp(x_flat, mx.array(safe_ind_np))
+            mx.eval(base_out)
+            out_np = np.array(base_out, dtype=np.float16)
+            x_np = np.array(x_flat, dtype=np.float32)
+
+            exp_positions = np.argwhere(ind_np >= base_limit)
+            for pos in exp_positions:
+                t_idx = int(pos[0])
+                k_idx = int(pos[1])
+                e_id = int(ind_np[t_idx, k_idx])
+                entry = self.engine.load_or_get_expert_entry(self.layer_idx, e_id)
+                x_tok = x_np[t_idx]
+                g_proj = x_tok @ entry.gate_w.astype(np.float32).T
+                u_proj = x_tok @ entry.up_w.astype(np.float32).T
+                act = (g_proj / (1.0 + np.exp(-g_proj))) * u_proj
+                out_np[t_idx, k_idx] = (act @ entry.down_w.astype(np.float32).T).astype(np.float16)
+
+            return mx.array(out_np)
+
     class SynapCoreMLXAttention(nn.Module):
         """
         Task P1.3: Fused-QKV Apple MLX Attention Layer supporting MHA, GQA, MQA, and optional QK-Norm.
@@ -1905,6 +1976,10 @@ if HAS_MLX_METAL:
             router_w: mx.array,
             attn: SynapCoreMLXAttention,
             switch_mlp: Union[SwitchGLU, SynapCoreOnDemandMoEMLP],
+            router_b: Optional[mx.array] = None,
+            gpu_slot_map: Optional[mx.array] = None,
+            layer_idx: int = 0,
+            thalamic_v2: Optional[object] = None,
         ):
             super().__init__()
             self.input_layernorm = nn.RMSNorm(hidden_size, eps=rms_eps)
@@ -1913,6 +1988,11 @@ if HAS_MLX_METAL:
             self.post_attention_layernorm.weight = post_norm_w
             self.self_attn = attn
             self.router_w: mx.array = mx.contiguous(router_w)
+            self.router_b: Optional[mx.array] = router_b
+            self.gpu_slot_map: Optional[mx.array] = gpu_slot_map
+            self.layer_idx: int = int(layer_idx)
+            self.norm_topk_prob: bool = bool(norm_topk_prob)
+            self.thalamic_v2: Optional[object] = thalamic_v2
             self.switch_mlp = switch_mlp
             self.route_fn = _compiled_olmoe_route_norm if norm_topk_prob else _compiled_olmoe_route_no_norm
 
@@ -1926,9 +2006,17 @@ if HAS_MLX_METAL:
             normed_post = self.post_attention_layernorm(x)
             B, L, D = normed_post.shape
             x_flat = normed_post.reshape(-1, D)
-            router_logits = x_flat @ self.router_w.T
-            indices, scores = self.route_fn(router_logits)
-            y = self.switch_mlp(x_flat, indices)
+            if self.thalamic_v2 is not None:
+                indices, scores = self.thalamic_v2.route_layer_mlx(  # type: ignore[attr-defined]
+                    self.layer_idx, x_flat, self.router_w, self.router_b, norm_topk_prob=self.norm_topk_prob
+                )
+            else:
+                router_logits = x_flat @ self.router_w.T
+                if self.router_b is not None:
+                    router_logits = router_logits + self.router_b
+                indices, scores = self.route_fn(router_logits)
+            exec_indices = mx.take(self.gpu_slot_map, indices) if self.gpu_slot_map is not None else indices
+            y = self.switch_mlp(x_flat, exec_indices)
             y = _compiled_moe_aggregate(y, scores)
             return x + y.reshape(B, L, D)
 
@@ -1942,9 +2030,17 @@ if HAS_MLX_METAL:
             normed_post = self.post_attention_layernorm(x)
             B, L, D = normed_post.shape
             x_flat = normed_post.reshape(-1, D)
-            router_logits = x_flat @ self.router_w.T
-            indices, scores = self.route_fn(router_logits)
-            y = self.switch_mlp(x_flat, indices)
+            if self.thalamic_v2 is not None:
+                indices, scores = self.thalamic_v2.route_layer_mlx(  # type: ignore[attr-defined]
+                    self.layer_idx, x_flat, self.router_w, self.router_b, norm_topk_prob=self.norm_topk_prob
+                )
+            else:
+                router_logits = x_flat @ self.router_w.T
+                if self.router_b is not None:
+                    router_logits = router_logits + self.router_b
+                indices, scores = self.route_fn(router_logits)
+            exec_indices = mx.take(self.gpu_slot_map, indices) if self.gpu_slot_map is not None else indices
+            y = self.switch_mlp(x_flat, exec_indices)
             y = _compiled_moe_aggregate(y, scores)
             return x + y.reshape(B, L, D), indices
 
@@ -2195,8 +2291,8 @@ class NativeKVPrefixCache:
                 k_layers_np: List[np.ndarray] = []
                 v_layers_np: List[np.ndarray] = []
                 for l_idx in range(self.num_layers):
-                    k_slice = mx.contiguous(mlx_caches[l_idx].keys[..., start:end, :])
-                    v_slice = mx.contiguous(mlx_caches[l_idx].values[..., start:end, :])
+                    k_slice = mx.contiguous(mlx_caches[l_idx].keys[..., start:end, :]).astype(mx.float16)
+                    v_slice = mx.contiguous(mlx_caches[l_idx].values[..., start:end, :]).astype(mx.float16)
                     mx.eval(k_slice, v_slice)
                     k_layers_np.append(np.array(k_slice, dtype=np.float16))
                     v_layers_np.append(np.array(v_slice, dtype=np.float16))
@@ -2285,6 +2381,8 @@ class NativeMerkleMoEEngine:
         kv_quant_mode: str = "fp16",
         device: str = "auto",
         shared_mlx_model: Optional["MLXBaseModelProtocol"] = None,
+        enable_expanded_experts: bool = False,
+        router_version: str = "v1",
     ):
         self.store_dir: Path = Path(store_dir)
         self.device: str = resolve_device(device)
@@ -2297,6 +2395,11 @@ class NativeMerkleMoEEngine:
         self.enable_merkle_kv: bool = enable_merkle_kv
         self.verify_merkle_on_load: bool = verify_merkle_on_load
         self.kv_quant_mode: str = kv_quant_mode
+        self.enable_expanded_experts: bool = bool(enable_expanded_experts)
+        self.router_version: str = "v2" if str(router_version).lower() == "v2" else "v1"
+        self.expanded_bank: Optional[object] = None
+        self.thalamic_router_v2: Optional[object] = None
+        self.active_domain_profile: Optional[object] = None
 
         self.config: Dict[str, Union[int, float, bool, str]] = validate_model_config(self.store_dir / "config.json")
         with open(self.store_dir / "merkle_manifest.json", "r") as f:
@@ -2306,7 +2409,8 @@ class NativeMerkleMoEEngine:
         self.cow_leaves_loaded: int = 0
 
         self.num_layers: int = int(self.config["num_hidden_layers"])
-        self.num_experts: int = int(self.config["num_experts"])
+        self.base_num_experts: int = int(self.config["num_experts"])
+        self.num_experts: int = self.base_num_experts
         self.top_k: int = int(self.config["num_experts_per_tok"])
         self.norm_topk_prob: bool = bool(self.config.get("norm_topk_prob", False))
         self.hidden_size: int = int(self.config["hidden_size"])
@@ -2376,8 +2480,29 @@ class NativeMerkleMoEEngine:
         )
         self.expert_index: Dict[Tuple[int, int], Tuple[str, int, int, bool]] = {}
         for l_idx in range(self.num_layers):
-            for e_idx in range(self.num_experts):
+            for e_idx in range(self.base_num_experts):
                 self.expert_index[(l_idx, e_idx)] = self.cpp.lookup_expert(l_idx, e_idx)
+
+        if self.enable_expanded_experts:
+            from native.expert_expansion import ExpandedExpertBankManager, detect_prompt_domain_profile
+            exp_bank = ExpandedExpertBankManager(self.store_dir)
+            if exp_bank.is_built():
+                self.expanded_bank = exp_bank
+                self.num_experts = exp_bank.total_experts
+                assert exp_bank.manifest is not None
+                self.active_merkle_root = str(exp_bank.manifest["expanded_model_merkle_root"])
+                for (l_i, e_i), meta in exp_bank.leaf_index.items():
+                    self.expert_index[(l_i, e_i)] = (
+                        str(meta["sha256_hex"]),
+                        int(meta["byte_offset"]),
+                        int(meta["byte_length"]),
+                        False,
+                    )
+                self.active_domain_profile = detect_prompt_domain_profile("hi", enable_thinking=True)
+                from native.thalamic_router_v2 import ThalamicRouterV2
+                self.thalamic_router_v2 = ThalamicRouterV2(self.store_dir, expanded_bank=exp_bank)
+            else:
+                self.enable_expanded_experts = False
 
         self.lsh_predictor = LSHLookaheadPredictor(num_layers=self.num_layers)
         self.async_pipeline = AsyncThreeStagePipeline(self, min_confidence_hits=2, top_n_prefetch=6)
@@ -2414,6 +2539,39 @@ class NativeMerkleMoEEngine:
 
         if self.use_mlx:
             self._init_mlx_backend(shared_mlx_model)
+
+    def set_router_version(self, router_version: str) -> None:
+        """Switches dynamically between 'v1' (Linear Co-Routed) and 'v2' (Thalamic 4-Stage Router)."""
+        self.router_version = "v2" if str(router_version).lower() == "v2" else "v1"
+        if self.thalamic_router_v2 is not None:
+            self.thalamic_router_v2.reset_session_state()  # type: ignore[attr-defined]
+        if self.use_mlx and HAS_MLX_METAL and hasattr(self, "mlx_layers"):
+            active_v2 = self.thalamic_router_v2 if self.router_version == "v2" else None
+            for layer_mod in self.mlx_layers:
+                layer_mod.thalamic_v2 = active_v2
+
+    def configure_domain_routing(
+        self, prompt: str, enable_thinking: bool = True, tools_json: Optional[str] = None
+    ) -> None:
+        if not self.enable_expanded_experts or self.expanded_bank is None:
+            return
+        from native.expert_expansion import detect_prompt_domain_profile
+        prof = detect_prompt_domain_profile(prompt, enable_thinking=enable_thinking, tools_json=tools_json)
+        self.active_domain_profile = prof
+        self.expanded_bank.reset_routing_counts()  # type: ignore[attr-defined]
+        if self.thalamic_router_v2 is not None:
+            self.thalamic_router_v2.reset_session_state()  # type: ignore[attr-defined]
+        if self.use_mlx and HAS_MLX_METAL and hasattr(self, "mlx_layers"):
+            active_v2 = self.thalamic_router_v2 if self.router_version == "v2" else None
+            for l_idx, layer_mod in enumerate(self.mlx_layers):
+                base_rw = self.core_np_views[f"model.layers.{l_idx}.mlp.gate.weight"]
+                full_rw, full_rb = self.expanded_bank.get_expanded_router_for_layer(  # type: ignore[attr-defined]
+                    l_idx, base_rw, prof
+                )
+                layer_mod.router_w = mx.contiguous(mx.array(full_rw))
+                layer_mod.router_b = mx.array(full_rb.astype(np.float16))
+                layer_mod.thalamic_v2 = active_v2
+            mx.eval([l.router_w for l in self.mlx_layers], [l.router_b for l in self.mlx_layers if l.router_b is not None])
 
     def set_profiler_enabled(self, enabled: bool) -> None:
         self.profiler.enabled = bool(enabled)
@@ -2488,7 +2646,18 @@ class NativeMerkleMoEEngine:
         mlx_g: Optional[object] = None
         mlx_u: Optional[object] = None
         mlx_d: Optional[object] = None
-        if self.use_mlx and self.on_demand_streaming and HAS_MLX_METAL:
+        if expert_idx >= self.base_num_experts and self.expanded_bank is not None:
+            t_mv0 = time.perf_counter() if prof_on else 0.0
+            gate_w, up_w, down_w, _ = self.expanded_bank.slice_expanded_expert_zero_copy(  # type: ignore[attr-defined]
+                layer_idx, expert_idx, verify=self.verify_merkle_on_load
+            )
+            if prof_on and self.verify_merkle_on_load:
+                self.profiler.record_stage("Merkle Verification", (time.perf_counter() - t_mv0) * 1000.0)
+            if self.use_mlx and self.on_demand_streaming and HAS_MLX_METAL:
+                mlx_g = mx.array(gate_w)
+                mlx_u = mx.array(up_w)
+                mlx_d = mx.array(down_w)
+        elif self.use_mlx and self.on_demand_streaming and HAS_MLX_METAL:
             if not hasattr(self, "_mlx_pread_staging_buf") or len(self._mlx_pread_staging_buf) != byte_len:
                 self._mlx_pread_staging_buf = bytearray(byte_len)
             staging_buf = self._mlx_pread_staging_buf
@@ -2543,7 +2712,7 @@ class NativeMerkleMoEEngine:
                         "Merkle Verification", (time.perf_counter() - t_mv0) * 1000.0
                     )
 
-        slot_id = self.adapter.compute_expert_slot_id(layer_idx, expert_idx)
+        slot_id = layer_idx * self.num_experts + expert_idx
         entry = ExpertCacheEntry(
             sha256_hex=sha_hex,
             slot_id=slot_id,
@@ -2590,23 +2759,49 @@ class NativeMerkleMoEEngine:
         use_norm = self.norm_topk_prob if norm_topk_prob is None else norm_topk_prob
         orig_shape = x_np.shape
         x_flat = x_np.reshape(-1, self.hidden_size).astype(np.float32)
-        if router_w_np is None:
-            router_w_np = self.core_np_views[f"model.layers.{layer_idx}.mlp.gate.weight"]
-        r_w = router_w_np.astype(np.float32)
+        if (
+            router_w_np is None
+            and self.enable_expanded_experts
+            and self.router_version == "v2"
+            and self.thalamic_router_v2 is not None
+        ):
+            base_rw = self.core_np_views[f"model.layers.{layer_idx}.mlp.gate.weight"]
+            topk_indices, topk_scores, _ = self.thalamic_router_v2.route_layer_numpy(  # type: ignore[attr-defined]
+                layer_idx,
+                x_flat,
+                base_rw,
+                profile=self.active_domain_profile,
+                norm_topk_prob=use_norm,
+            )
+        else:
+            router_b_f32: Optional[np.ndarray] = None
+            if router_w_np is None:
+                base_rw = self.core_np_views[f"model.layers.{layer_idx}.mlp.gate.weight"]
+                if self.enable_expanded_experts and self.expanded_bank is not None:
+                    router_w_np, router_b_f32 = self.expanded_bank.get_expanded_router_for_layer(  # type: ignore[attr-defined]
+                        layer_idx, base_rw, self.active_domain_profile
+                    )
+                else:
+                    router_w_np = base_rw
+            r_w = router_w_np.astype(np.float32)
 
-        logits = x_flat @ r_w.T
-        logits_max = np.max(logits, axis=-1, keepdims=True)
-        exp_logits = np.exp(logits - logits_max)
-        probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+            logits = x_flat @ r_w.T
+            if router_b_f32 is not None:
+                logits = logits + router_b_f32[None, :]
+            logits_max = np.max(logits, axis=-1, keepdims=True)
+            exp_logits = np.exp(logits - logits_max)
+            probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
 
-        topk_indices = np.argpartition(-probs, kth=self.top_k - 1, axis=-1)[:, : self.top_k].astype(np.int32)
-        topk_scores = np.take_along_axis(probs, topk_indices, axis=-1)
-        if use_norm:
-            topk_scores = topk_scores / np.sum(topk_scores, axis=-1, keepdims=True)
+            topk_indices = np.argpartition(-probs, kth=self.top_k - 1, axis=-1)[:, : self.top_k].astype(np.int32)
+            topk_scores = np.take_along_axis(probs, topk_indices, axis=-1)
+            if use_norm:
+                topk_scores = topk_scores / np.sum(topk_scores, axis=-1, keepdims=True)
         if prof_on:
             self.profiler.record_stage("Router", (time.perf_counter() - t_rt0) * 1000.0)
 
         self.live_routing_buffer.record_numpy_layer(layer_idx, topk_indices)
+        if self.enable_expanded_experts and self.expanded_bank is not None:
+            self.expanded_bank.record_routed_experts(topk_indices)  # type: ignore[attr-defined]
 
         out_flat = np.zeros_like(x_flat, dtype=np.float32)
         for t_idx in range(x_flat.shape[0]):
@@ -2703,6 +2898,12 @@ class NativeMerkleMoEEngine:
 
         t_sm0 = time.perf_counter() if prof_on else 0.0
         h_last = self._rmsnorm_numpy(h[:, -1, :], self.core_np_views["model.norm.weight"])[0]
+        if self.enable_expanded_experts and self.router_version == "v2" and self.thalamic_router_v2 is not None:
+            self.thalamic_router_v2.update_topdown_context_numpy(h_last)  # type: ignore[attr-defined]
+        if self.enable_expanded_experts and self.expanded_bank is not None:
+            h_last = self.expanded_bank.apply_domain_residual_adapter_numpy(  # type: ignore[attr-defined]
+                h_last[None, :], self.active_domain_profile
+            )[0]
         logits_raw = self.lm_head_w_int8_view.astype(np.float32) @ h_last
         logits = logits_raw * self.lm_head_s_fp16_view[:, 0].astype(np.float32)
         if prof_on:
@@ -2754,15 +2955,34 @@ class NativeMerkleMoEEngine:
         gate_layer_np: Optional[np.ndarray] = None
         up_layer_np: Optional[np.ndarray] = None
         down_layer_np: Optional[np.ndarray] = None
+        hot_per_domain = 4
+        pinned_switch_experts = (
+            self.base_num_experts + (3 * hot_per_domain)
+            if self.num_experts > 76
+            else self.num_experts
+        )
+        shared_gpu_slot_map: Optional[mx.array] = None
+        if self.num_experts > pinned_switch_experts and self.expanded_bank is not None:
+            epd = int(self.expanded_bank.experts_per_domain)  # type: ignore[attr-defined]
+            slot_map_np = np.arange(self.num_experts, dtype=np.int32)
+            for d_idx in range(3):
+                d_start = self.base_num_experts + d_idx * epd
+                d_end = d_start + epd
+                hot_base = self.base_num_experts + d_idx * hot_per_domain
+                for e_id in range(d_start, d_end):
+                    slot_map_np[e_id] = hot_base + ((e_id - d_start) % hot_per_domain)
+            shared_gpu_slot_map = mx.array(slot_map_np, dtype=mx.int32)
+            mx.eval(shared_gpu_slot_map)
+
         if has_any_pinned and shared_mlx_model is None:
             gate_layer_np = np.empty(
-                (self.num_experts, self.intermediate_size, self.hidden_size), dtype=np.float16
+                (pinned_switch_experts, self.intermediate_size, self.hidden_size), dtype=np.float16
             )
             up_layer_np = np.empty(
-                (self.num_experts, self.intermediate_size, self.hidden_size), dtype=np.float16
+                (pinned_switch_experts, self.intermediate_size, self.hidden_size), dtype=np.float16
             )
             down_layer_np = np.empty(
-                (self.num_experts, self.hidden_size, self.intermediate_size), dtype=np.float16
+                (pinned_switch_experts, self.hidden_size, self.intermediate_size), dtype=np.float16
             )
 
         for l_idx in range(self.num_layers):
@@ -2788,30 +3008,64 @@ class NativeMerkleMoEEngine:
             is_layer_pinned = (not self.on_demand_streaming) or (l_idx < self.pinned_layers)
             if not is_layer_pinned:
                 switch_mlp: Union[SwitchGLU, SynapCoreOnDemandMoEMLP] = SynapCoreOnDemandMoEMLP(self, l_idx)
-            elif shared_mlx_model is not None and self.cow_leaves_loaded == 0:
+            elif shared_mlx_model is not None and self.cow_leaves_loaded == 0 and not self.enable_expanded_experts:
                 switch_mlp = shared_mlx_model.model.layers[l_idx].mlp.switch_mlp
             else:
-                assert gate_layer_np is not None and up_layer_np is not None and down_layer_np is not None
-                switch_mlp = SwitchGLU(self.hidden_size, self.intermediate_size, self.num_experts, bias=False)
-                for e_idx in range(self.num_experts):
-                    if self.verify_merkle_on_load:
-                        self.cpp.verify_expert_leaf_bytes(l_idx, e_idx, force=False)
-                    _, byte_off, byte_len, _ = self.expert_index[(l_idx, e_idx)]
-                    gate_w, up_w, down_w = self.cpp.slice_expert_weights_zero_copy(
-                        byte_off, self.hidden_size, self.intermediate_size
+                if gate_layer_np is None:
+                    gate_layer_np = np.empty(
+                        (pinned_switch_experts, self.intermediate_size, self.hidden_size), dtype=np.float16
                     )
-                    gate_layer_np[e_idx] = gate_w
-                    up_layer_np[e_idx] = up_w
-                    down_layer_np[e_idx] = down_w
-                    madvise_range(self.cas_mmap, byte_off, byte_len, MADV_DONTNEED)
-                switch_mlp.gate_proj.weight = mx.array(gate_layer_np)
-                switch_mlp.up_proj.weight = mx.array(up_layer_np)
-                switch_mlp.down_proj.weight = mx.array(down_layer_np)
-                mx.eval(switch_mlp.parameters())
+                    up_layer_np = np.empty(
+                        (pinned_switch_experts, self.intermediate_size, self.hidden_size), dtype=np.float16
+                    )
+                    down_layer_np = np.empty(
+                        (pinned_switch_experts, self.hidden_size, self.intermediate_size), dtype=np.float16
+                    )
+                base_switch = SwitchGLU(self.hidden_size, self.intermediate_size, pinned_switch_experts, bias=False)
+                for e_idx in range(pinned_switch_experts):
+                    if e_idx < self.base_num_experts:
+                        if self.verify_merkle_on_load:
+                            self.cpp.verify_expert_leaf_bytes(l_idx, e_idx, force=False)
+                        _, byte_off, byte_len, _ = self.expert_index[(l_idx, e_idx)]
+                        gate_w, up_w, down_w = self.cpp.slice_expert_weights_zero_copy(
+                            byte_off, self.hidden_size, self.intermediate_size
+                        )
+                        gate_layer_np[e_idx] = gate_w
+                        up_layer_np[e_idx] = up_w
+                        down_layer_np[e_idx] = down_w
+                        madvise_range(self.cas_mmap, byte_off, byte_len, MADV_DONTNEED)
+                    else:
+                        assert self.expanded_bank is not None
+                        epd = int(self.expanded_bank.experts_per_domain)  # type: ignore[attr-defined]
+                        rel_slot = e_idx - self.base_num_experts
+                        d_idx = rel_slot // hot_per_domain
+                        k_in_d = rel_slot % hot_per_domain
+                        real_exp_id = self.base_num_experts + d_idx * epd + k_in_d
+                        gate_w, up_w, down_w, _ = self.expanded_bank.slice_expanded_expert_zero_copy(  # type: ignore[attr-defined]
+                            l_idx, real_exp_id, verify=self.verify_merkle_on_load
+                        )
+                        gate_layer_np[e_idx] = gate_w
+                        up_layer_np[e_idx] = up_w
+                        down_layer_np[e_idx] = down_w
+                base_switch.gate_proj.weight = mx.array(gate_layer_np)
+                base_switch.up_proj.weight = mx.array(up_layer_np)
+                base_switch.down_proj.weight = mx.array(down_layer_np)
+                mx.eval(base_switch.parameters())
+                switch_mlp = base_switch
 
             in_norm_w = core_arrays.pop(f"{p}.input_layernorm.weight")
             post_norm_w = core_arrays.pop(f"{p}.post_attention_layernorm.weight")
-            router_w = core_arrays.pop(f"{p}.mlp.gate.weight")
+            base_router_arr = core_arrays.pop(f"{p}.mlp.gate.weight")
+            router_b_arr: Optional[mx.array] = None
+            if self.enable_expanded_experts and self.expanded_bank is not None:
+                base_rw_np = self.core_np_views[f"{p}.mlp.gate.weight"]
+                full_rw_np, full_rb_np = self.expanded_bank.get_expanded_router_for_layer(  # type: ignore[attr-defined]
+                    l_idx, base_rw_np, self.active_domain_profile
+                )
+                router_w = mx.array(full_rw_np)
+                router_b_arr = mx.array(full_rb_np.astype(np.float16))
+            else:
+                router_w = base_router_arr
 
             layer_mod = SynapCoreMLXLayer(
                 hidden_size=self.hidden_size,
@@ -2822,6 +3076,10 @@ class NativeMerkleMoEEngine:
                 router_w=router_w,
                 attn=attn,
                 switch_mlp=switch_mlp,
+                router_b=router_b_arr,
+                gpu_slot_map=shared_gpu_slot_map if is_layer_pinned else None,
+                layer_idx=l_idx,
+                thalamic_v2=self.thalamic_router_v2 if self.router_version == "v2" else None,
             )
             self.mlx_layers.append(layer_mod)
 
@@ -2844,6 +3102,8 @@ class NativeMerkleMoEEngine:
                 mx.array([[3]], dtype=mx.int32), dummy_cache, record_live_routing=False
             )
             mx.eval(logits2)
+        if self.thalamic_router_v2 is not None:
+            self.thalamic_router_v2.reset_session_state()  # type: ignore[attr-defined]
         mx.clear_cache()
 
     def _mlx_forward_fast(
@@ -2865,6 +3125,8 @@ class NativeMerkleMoEEngine:
             for layer, c in zip(self.mlx_layers, cache):
                 h = layer(h, mask, c)
         h_last = self.mlx_final_norm(h[:, -1:, :])
+        if record_live_routing and self.router_version == "v2" and self.thalamic_router_v2 is not None:
+            self.thalamic_router_v2.update_topdown_context_mlx(h_last)  # type: ignore[attr-defined]
         return (h_last @ self.mlx_lm_head_w.T).squeeze(1)
 
     def profile_token_step_mlx(
@@ -2904,7 +3166,8 @@ class NativeMerkleMoEEngine:
                             self.load_or_get_expert_entry(l_idx, int(e_id), is_prefetch=False)
 
                     t_me0 = time.perf_counter()
-                    y_mlp = layer.switch_mlp(x_flat, indices)
+                    exec_ind = mx.take(layer.gpu_slot_map, indices) if layer.gpu_slot_map is not None else indices
+                    y_mlp = layer.switch_mlp(x_flat, exec_ind)
                     y_agg = _compiled_moe_aggregate(y_mlp, scores)
                     h = h + y_agg.reshape(B, L, D)
                     mx.eval(h)
@@ -2967,6 +3230,10 @@ class NativeMerkleMoEEngine:
         if all_routed_np.size == 0:
             return
 
+        if self.enable_expanded_experts and self.expanded_bank is not None:
+            self.expanded_bank.record_routed_experts(all_routed_np)  # type: ignore[attr-defined]
+        if self.enable_expanded_experts and self.router_version == "v2" and self.thalamic_router_v2 is not None:
+            self.thalamic_router_v2.record_post_generation_trace(all_routed_np)  # type: ignore[attr-defined]
         num_steps, num_layers, _ = all_routed_np.shape
         for s_idx in range(num_steps):
             for l_idx in range(num_layers):
@@ -2982,7 +3249,7 @@ class NativeMerkleMoEEngine:
                     if self.enable_lookahead:
                         for p_exp in pred:
                             sha_hex, byte_off, byte_len, is_cow = self.expert_index[(l_idx, p_exp)]
-                            if (not is_cow) and (sha_hex not in self.expert_cache.cache):
+                            if (not is_cow) and (p_exp < self.base_num_experts) and (sha_hex not in self.expert_cache.cache):
                                 self.cpp.prefetch_cold_expert(
                                     l_idx,
                                     p_exp,
@@ -3078,6 +3345,12 @@ class NativeMerkleMoEEngine:
         self.profiler.reset()
 
     def close(self) -> None:
+        if getattr(self, "expanded_bank", None) is not None:
+            try:
+                self.expanded_bank.close()  # type: ignore[union-attr]
+            except Exception:
+                pass
+            self.expanded_bank = None
         if hasattr(self, "async_pipeline"):
             self.async_pipeline.close()
         self.live_routing_buffer.reset()

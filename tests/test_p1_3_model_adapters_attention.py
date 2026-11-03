@@ -6,17 +6,21 @@ Model Compatibility Adapter Layer (`models/adapters.py`) & Modular Attention Sub
 Verifies:
   1. `create_model_adapter()` auto-detection, standardized `ModelArchitectureSpec`,
      weight name resolution, and dynamic `compute_expert_slot_id()` / `decode_expert_slot_id()`
-     across all 4 required adapters:
+     across all required adapters:
        - `OLMoEAdapter` (64 experts, Top-8, MHA 16/16, QK-Norm, `shift=6`)
        - `MixtralAdapter` (8 experts, Top-2, GQA 32/8, no QK-Norm, `shift=3`, `block_sparse_moe`)
        - `QwenMoEAdapter` (60 routed experts + 1 shared expert, Top-4, GQA 16/4, non-power-of-2 linear slot indexing)
        - `DenseAdapter` (`is_moe=False`, `num_experts=0`, router-free SwiGLU execution)
+       - `GLM53MoEDsaAdapter` (`zai-org/GLM-5.3`, `GlmMoeDsaForCausalLM`, 78 layers = 3 Dense + 75 Sparse MoE × 256
+         routed experts + 1 shared expert, Top-8, `shift=8`, 21 Full + 57 Shared DSA Indexer layers, Sigmoid `noaux_tc`
+         routing with `e_score_correction_bias` and `routed_scaling_factor=2.5`, plus FP8 E4M3 `[128, 128]` dequantization)
   2. `QwenMoEAdapter.forward_shared_plus_routed_numpy()` and `DenseAdapter.forward_dense_mlp_numpy()`
      mathematical correctness.
   3. `ModularAttentionEngine` standalone execution across MHA (`16/16` + QK-Norm), GQA (`16/4`, no QK-Norm),
      and MQA (`16/1`), plus **100% bit-exact numerical parity (`max_abs_diff == 0.0`)** against
      `NativeMerkleMoEEngine` on real `OLMoE-1B-7B` Layer 0 weights!
   4. Standalone Attention Subsystem Micro-Benchmark (`benchmark_attention_subsystem`) across MHA, GQA, and MQA.
+  5. `GLM53MoEDsaAdapter` & `NativeGLM53MerkleEngine` (`zai-org/GLM-5.3` 755.6 GB FP8 MoE) verification.
 """
 
 from __future__ import annotations
@@ -35,12 +39,20 @@ if str(ROOT_DIR) not in sys.path:
 
 from models.adapters import (
     DenseAdapter,
+    GLM53MoEDsaAdapter,
     MixtralAdapter,
     ModularAttentionEngine,
     OLMoEAdapter,
     QwenMoEAdapter,
     benchmark_attention_subsystem,
     create_model_adapter,
+    dequantize_fp8_e4m3_blockwise_numpy,
+)
+from native.glm53_engine import (
+    GLM53_STORE_DIR,
+    NativeGLM53MerkleEngine,
+    get_official_glm53_config,
+    resolve_glm53_ram_budget_plan,
 )
 from native.native_engine import NativeMerkleMoEEngine
 
@@ -293,6 +305,105 @@ class TestP13ModelAdaptersAndModularAttention(unittest.TestCase):
                 f"Prefill (32 toks): {r['prefill_ms']:>6.3f} ms | "
                 f"Decode Step: {r['decode_step_ms']:>6.3f} ms ({r['decode_tok_per_sec']:>8.1f} tok/s)"
             )
+
+    def test_5_glm53_moe_dsa_adapter_and_merkle_engine(self) -> None:
+        """
+        Verifies `GLM53MoEDsaAdapter` (`zai-org/GLM-5.3`, `GlmMoeDsaForCausalLM`, 744B Total / 40B Active):
+          - Auto-detection via `create_model_adapter(get_official_glm53_config())`
+          - 78 layers (`3` Dense layers `0..2` + `75` Sparse MoE layers `3..77` × `256` routed experts = `19,200` routed experts)
+          - `expert_index_shift == 8` (`256 = 2^8`) slot indexing `(layer_idx << 8) | expert_idx`
+          - `21` Full DSA Indexer layers (`0, 1, 2, 6, 10, ..., 74`) vs `57` Shared Indexer layers (`IndexShare`)
+          - Sigmoid `noaux_tc` routing with `e_score_correction_bias` and `routed_scaling_factor = 2.5`
+          - FP8 `e4m3` (`weight_block_size = [128, 128]`) blockwise dequantization
+          - `NativeGLM53MerkleEngine` (`glm53_merkle_store/merkle_tree.idx` `SYNPIDX1` 1,024/1,024 XOR proofs)
+        """
+        cfg = get_official_glm53_config()
+        adapter = create_model_adapter(cfg)  # type: ignore[arg-type]
+        self.assertIsInstance(adapter, GLM53MoEDsaAdapter)
+        assert isinstance(adapter, GLM53MoEDsaAdapter)
+
+        self.assertEqual(adapter.spec.model_type, "glm_moe_dsa")
+        self.assertEqual(adapter.spec.architecture_family, "GlmMoeDsaForCausalLM")
+        self.assertEqual(adapter.spec.num_layers, 78)
+        self.assertEqual(adapter.spec.num_experts, 256)
+        self.assertEqual(adapter.spec.top_k, 8)
+        self.assertEqual(adapter.spec.hidden_size, 6144)
+        self.assertEqual(adapter.spec.intermediate_size, 2048)
+        self.assertEqual(adapter.dense_intermediate_size, 12288)
+        self.assertEqual(adapter.spec.vocab_size, 154880)
+        self.assertEqual(adapter.spec.expert_index_shift, 8)
+        self.assertEqual(adapter.num_dense_mlp_layers, 3)
+        self.assertEqual(adapter.num_sparse_moe_layers, 75)
+        self.assertEqual(adapter.total_routed_experts, 19200)
+
+        # Slot indexing for 256 experts (shift=8)
+        slot_l77_e255 = adapter.compute_expert_slot_id(77, 255)
+        self.assertEqual(slot_l77_e255, (77 << 8) | 255)
+        self.assertEqual(adapter.decode_expert_slot_id(slot_l77_e255), (77, 255))
+
+        # Verify 21 full DSA indexer layers & 57 shared indexer layers
+        full_idx_layers = [l for l in range(78) if adapter.is_full_dsa_indexer_layer(l)]
+        shared_idx_layers = [l for l in range(78) if not adapter.is_full_dsa_indexer_layer(l)]
+        self.assertEqual(len(full_idx_layers), 21)
+        self.assertEqual(len(shared_idx_layers), 57)
+        self.assertEqual(full_idx_layers[:6], [0, 1, 2, 6, 10, 14])
+
+        # Verify Layer 0 (Dense + Full DSA Indexer) vs Layer 3 (Sparse MoE + Shared DSA Indexer) weight names
+        l0_weights = adapter.layer_weight_names(0)
+        self.assertIn("dense_gate_proj", l0_weights)
+        self.assertNotIn("router_gate", l0_weights)
+        self.assertIn("indexer_wq_b", l0_weights)
+        self.assertIn("q_a_proj", l0_weights)
+        self.assertIn("kv_a_proj_with_mqa", l0_weights)
+
+        l3_weights = adapter.layer_weight_names(3)
+        self.assertIn("router_gate", l3_weights)
+        self.assertIn("router_score_correction_bias", l3_weights)
+        self.assertIn("shared_expert_gate_proj", l3_weights)
+        self.assertNotIn("dense_gate_proj", l3_weights)
+        self.assertNotIn("indexer_wq_b", l3_weights)
+
+        exp_w = adapter.expert_weight_names(3, 142)
+        self.assertEqual(exp_w[0], "model.layers.3.mlp.experts.142.gate_proj.weight")
+        exp_s = adapter.expert_scale_inv_names(3, 142)
+        self.assertEqual(exp_s[0], "model.layers.3.mlp.experts.142.gate_proj.weight_scale_inv")
+
+        # Verify FP8 E4M3 [128, 128] blockwise dequantization
+        w_u8 = np.full((256, 256), 0x38, dtype=np.uint8)  # 0x38 in E4M3 (exp=7, mant=0) == 1.0
+        scales = np.array([[0.5, 2.0], [1.5, 0.25]], dtype=np.float32)
+        deq = dequantize_fp8_e4m3_blockwise_numpy(w_u8, scales, block_size=(128, 128))
+        self.assertEqual(deq.shape, (256, 256))
+        self.assertAlmostEqual(float(deq[0, 0]), 0.5, places=6)
+        self.assertAlmostEqual(float(deq[0, 200]), 2.0, places=6)
+        self.assertAlmostEqual(float(deq[200, 0]), 1.5, places=6)
+        self.assertAlmostEqual(float(deq[200, 200]), 0.25, places=6)
+
+        # Verify RAM Budget tiers for 755.6 GB FP8 checkpoint
+        plan_low = resolve_glm53_ram_budget_plan(max_ram_mb=8192.0)
+        self.assertEqual(plan_low["tier_mode"], "low_ram_streaming")
+        self.assertTrue(plan_low["on_demand_streaming"])
+        self.assertEqual(plan_low["pinned_layers"], 0)
+
+        plan_hyb = resolve_glm53_ram_budget_plan(max_ram_mb=65536.0)
+        self.assertEqual(plan_hyb["tier_mode"], "hybrid_ram_budget")
+        self.assertTrue(plan_hyb["on_demand_streaming"])
+        self.assertGreater(plan_hyb["pinned_layers"], 3)
+
+        # Verify NativeGLM53MerkleEngine SYNPIDX1 initialization and execution
+        eng = NativeGLM53MerkleEngine(store_dir=GLM53_STORE_DIR, max_ram_budget_mb=4096.0, device="cpu")
+        try:
+            prompt_ids = eng.format_prompt("Run GLM-5.3 on SynapCore Merkle-MoE", reasoning_effort="max")
+            res = eng.generate_stream(prompt_ids, max_new_tokens=8)
+            self.assertEqual(int(res["xor_proofs"]), 1040)
+            self.assertEqual(int(res["tier2_byte_proofs"]), 16)
+            self.assertEqual(int(res["num_tokens"]), 8)
+        finally:
+            eng.close()
+
+        print(
+            "[PASS] Test 5 — GLM53MoEDsaAdapter (78 Layers, 256 Routed + 1 Shared Expert, "
+            "Sigmoid noaux_tc Routing, FP8 E4M3 [128,128] Dequant & NativeGLM53MerkleEngine) Verified!"
+        )
 
 
 if __name__ == "__main__":

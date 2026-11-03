@@ -12,4 +12,15 @@ dist/
 olmoe_merkle_store/*.bin
 olmoe_merkle_store/*.db*
 olmoe_merkle_store/*.idx
+olmoe_merkle_store/*.npz
+olmoe_merkle_store/*.bak
+olmoe_merkle_store/datasets/
 olmoe_merkle_store/kv_cache_blocks/
+qwen38_merkle_store/*.bin
+qwen38_merkle_store/*.idx
+qwen38_merkle_store/*.safetensors
+qwen38_merkle_store/kv_cache_blocks/
+glm53_merkle_store/*.bin
+glm53_merkle_store/*.idx
+glm53_merkle_store/*.safetensors
+glm53_merkle_store/kv_cache_blocks/

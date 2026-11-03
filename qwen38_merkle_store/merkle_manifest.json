@@ -1,0 +1,23 @@
+{
+  "model_name": "Qwen3.8-27B-MLX-8bit",
+  "model_type": "qwen3_5",
+  "architecture": "Qwen3_5ForConditionalGeneration",
+  "quantization": {
+    "bits": 8,
+    "group_size": 64,
+    "mode": "affine"
+  },
+  "num_layers": 64,
+  "num_sub_blocks_per_layer": 16,
+  "num_linear_attention_layers": 48,
+  "num_full_attention_layers": 16,
+  "hidden_size": 5120,
+  "intermediate_size": 17408,
+  "vocab_size": 248320,
+  "orig_safetensors_total_bytes": 29501218261,
+  "model_merkle_root": "53e2c219477278176ccfd9213f2ab3ba007cc2405c15bfedf8ae1f8dac70d193",
+  "embedding_trie_root": "84604488488548a29d04579f4ba5df48bda618ff897f450456586246fd7e306a",
+  "shared_core_root": "b61b21dc8274a35a33e863d362eca7ab6c88e8dc6e390ae7ba9ab703edd2d1f0",
+  "expert_tree_root": "d1c5ae93f81c174d09d035055b6582a7b8768c84ae239600a130bbe3dee21879",
+  "output_head_root": "4fda5b693ffc5f9ecc5c90719d1e0176fc75ff2a9ea40e42fd82ad648baae3d3"
+}

@@ -1,0 +1,17 @@
+{
+  "schema_version": "SYNAPCORE_THALAMIC_ROUTER_V2.2_FULL_COUPLED",
+  "num_layers": 16,
+  "total_experts_per_layer": 256,
+  "topdown_rank": 32,
+  "alpha_inertia": 0.8,
+  "gamma_inertia": 0.28,
+  "beta_topdown": 0.35,
+  "topdown_ema_decay": 0.75,
+  "base_topdown_scale": 0.14,
+  "domain_topdown_scale": 0.45,
+  "kappa_neuromod": 0.55,
+  "lambda_hebbian": 0.32,
+  "hebbian_updates_applied": 160,
+  "hebbian_matrix_l2_norm": 2.875065,
+  "state_sha256": "48b76744c1f39b56cf7217c4e74c21ffc98241dff48b7950910a1ce6db0bf042"
+}

@@ -159,7 +159,7 @@ class StandaloneSynapCoreChat:
         self.device = resolve_device(device)
         self.use_mlx = HAS_MLX_METAL and (device in ("auto", "mps", "mlx")) and not self.is_glm53
 
-        if self.use_mlx and (max_ram_mb is None or max_ram_mb >= 28736.0):
+        if self.use_mlx and (not self.is_qwen38 or max_ram_mb is None or max_ram_mb >= 28736.0):
             maybe_set_recommended_wired_limit()
 
         if self.is_glm53:

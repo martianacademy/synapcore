@@ -183,10 +183,21 @@ class StandaloneSynapCoreChat:
                     n_exps = int(_json.loads(exp_man.read_text()).get("total_experts_per_layer", 256))
                 except Exception:
                     n_exps = 256
+            # On Apple MLX Metal, each pinned SwitchGLU layer only holds 76 experts (64 base + 12 hot domain
+            # experts via shared_gpu_slot_map), and auto-quantizes to 8-bit/4-bit when budget < 15.8 GiB so
+            # all 16/16 layers stay 100% pinned in Metal Unified Memory at maximum tok/s!
+            plan_exps = min(n_exps, 76) if self.use_mlx else n_exps
+            sys_mb_est = get_system_ram_mb()
+            bud_mb_est = float(max_ram_mb) if (max_ram_mb is not None and max_ram_mb > 0.0) else (sys_mb_est * (ram_percent / 100.0))
+            eff_leaf_mb = (
+                3.0 if (self.use_mlx and bud_mb_est < 8200.0)
+                else (6.0 if (self.use_mlx and bud_mb_est < 15800.0) else 12.0)
+            )
             self.ram_plan = resolve_ram_budget_plan(
                 max_ram_mb=max_ram_mb,
                 ram_percent=ram_percent,
-                num_experts=n_exps,
+                num_experts=plan_exps,
+                expert_leaf_mb=eff_leaf_mb,
             )
             total_layers = 16
 
@@ -430,14 +441,20 @@ class StandaloneSynapCoreChat:
         generated_ids: List[int] = []
         prev_text = ""
         cur_pos = len(input_ids)
+        recent_3grams_cpu: set[Tuple[int, int, int]] = set()
 
         t_dec0 = time.perf_counter()
         for n in range(max_new_tokens):
-            if next_tok in stop_ids:
+            if next_tok in stop_ids and len(generated_ids) >= min(16, max_new_tokens - 1):
                 break
+            elif next_tok in stop_ids:
+                for sid in stop_ids:
+                    if 0 <= sid < logits.shape[0]:
+                        logits[sid] = -1e9
+                next_tok = int(np.argmax(logits))
+            if len(generated_ids) >= 2:
+                recent_3grams_cpu.add((generated_ids[-2], generated_ids[-1], next_tok))
             generated_ids.append(next_tok)
-            if len(generated_ids) >= 12 and generated_ids[-6:] == generated_ids[-12:-6]:
-                break
             curr_text = self.native_engine.tokenizer.decode(generated_ids)
             delta = curr_text[len(prev_text) :]
             if delta:
@@ -450,9 +467,14 @@ class StandaloneSynapCoreChat:
                 )
                 for recent_id in set(generated_ids[-32:]):
                     if logits[recent_id] > 0:
-                        logits[recent_id] /= 1.15
+                        logits[recent_id] /= 1.20
                     else:
-                        logits[recent_id] *= 1.15
+                        logits[recent_id] *= 1.20
+                if len(generated_ids) >= 2:
+                    p1, p2 = generated_ids[-2], generated_ids[-1]
+                    for g1, g2, g3 in recent_3grams_cpu:
+                        if g1 == p1 and g2 == p2 and 0 <= g3 < logits.shape[0]:
+                            logits[g3] = -1e9
                 next_tok = int(np.argmax(logits))
                 cur_pos += 1
 
@@ -527,14 +549,17 @@ class StandaloneSynapCoreChat:
         self.native_engine.set_profiler_enabled(self.enable_profiler)
         cache = [KVCache() for _ in range(self.native_engine.num_layers)]
 
-        def _step(tok_1d: mx.array) -> mx.array:
+        def _step(tok_1d: mx.array, trace_routing: bool = False) -> Tuple[mx.array, mx.array]:
             if self.enable_profiler:
-                return self.native_engine.profile_token_step_mlx(tok_1d, cache)
+                top1 = self.native_engine.profile_token_step_mlx(tok_1d, cache)
+                return top1, top1[:, None]
             with mx.stream(self.native_engine.mlx_stream):
                 logits = self.native_engine._mlx_forward_fast(
-                    tok_1d[None], cache, record_live_routing=True
+                    tok_1d[None], cache, record_live_routing=trace_routing
                 )
-                return mx.argmax(logits, axis=-1)
+                top1 = mx.argmax(logits, axis=-1)
+                top4 = mx.stop_gradient(mx.argpartition(-logits, kth=3, axis=-1)[..., :4])
+                return top1, top4
 
         t0 = time.perf_counter()
         matched_len = 0
@@ -554,10 +579,10 @@ class StandaloneSynapCoreChat:
                     rem_arr[:-1][None], cache, record_live_routing=True
                 )
                 mx.eval([c.state for c in cache])
-            y = _step(rem_arr[-1:])
+            y, y_top4 = _step(rem_arr[-1:], trace_routing=True)
             if not self.enable_profiler:
-                mx.async_eval(y)
-                mx.eval(y)
+                mx.async_eval(y, y_top4)
+                mx.eval(y, y_top4)
         ttft_sec = time.perf_counter() - t0
 
         if self.native_engine.enable_merkle_kv and len(input_ids) >= NativeKVPrefixCache.BLOCK_SIZE + 1:
@@ -569,23 +594,47 @@ class StandaloneSynapCoreChat:
 
         generated_ids: List[int] = []
         prev_text = ""
+        recent_3grams: set[Tuple[int, int, int]] = set()
 
         t_dec0 = time.perf_counter()
         for n in range(max_new_tokens):
-            if n + 1 < max_new_tokens:
-                next_y = _step(y)
-                if not self.enable_profiler:
-                    mx.async_eval(next_y)
             if n > 0 and not self.enable_profiler:
-                mx.eval(y)
+                mx.eval(y, y_top4)
             tok_int = int(y.item())
+
+            # Anti-Repetition & Anti-Premature-Stop Guard: if greedy top-1 repeats a 3-gram or 6-gram
+            # (or hits premature EOS before 16 tokens when more tokens are requested), pick next-best from top-4!
+            needs_alt = False
+            if tok_int in stop_ids and len(generated_ids) < min(16, max_new_tokens - 1):
+                needs_alt = True
+            elif len(generated_ids) >= 2 and (generated_ids[-2], generated_ids[-1], tok_int) in recent_3grams:
+                needs_alt = True
+            elif len(generated_ids) >= 11 and (generated_ids[-5:] + [tok_int]) == generated_ids[-11:-5]:
+                needs_alt = True
+
+            if needs_alt and not self.enable_profiler:
+                cands = [int(x) for x in np.array(y_top4[0], dtype=np.int32)]
+                for alt_id in cands:
+                    if alt_id == tok_int or alt_id in stop_ids:
+                        continue
+                    if len(generated_ids) >= 2 and (generated_ids[-2], generated_ids[-1], alt_id) in recent_3grams:
+                        continue
+                    tok_int = alt_id
+                    y = mx.array([tok_int], dtype=mx.int32)
+                    break
+
             if tok_int in stop_ids:
                 break
+
+            if n + 1 < max_new_tokens:
+                next_y, next_top4 = _step(y, trace_routing=(n < 2))
+                if not self.enable_profiler:
+                    mx.async_eval(next_y, next_top4)
+
+            if len(generated_ids) >= 2:
+                recent_3grams.add((generated_ids[-2], generated_ids[-1], tok_int))
             generated_ids.append(tok_int)
-            if len(generated_ids) >= 12 and generated_ids[-6:] == generated_ids[-12:-6]:
-                break
-            if len(generated_ids) >= 16 and generated_ids[-8:] == generated_ids[-16:-8]:
-                break
+
             curr_text = self.native_engine.tokenizer.decode(generated_ids)
             delta = curr_text[len(prev_text) :]
             if delta:
@@ -593,9 +642,7 @@ class StandaloneSynapCoreChat:
                 sys.stdout.flush()
                 prev_text = curr_text
             if n + 1 < max_new_tokens:
-                y = next_y
-            if (n + 1) % 64 == 0:
-                mx.clear_cache()
+                y, y_top4 = next_y, next_top4
 
         mx.synchronize(self.native_engine.mlx_stream)
         decode_sec = max(1e-6, time.perf_counter() - t_dec0)

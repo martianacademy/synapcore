@@ -3072,6 +3072,9 @@ class NativeMerkleMoEEngine:
                 base_switch.gate_proj.weight = mx.array(gate_layer_np)
                 base_switch.up_proj.weight = mx.array(up_layer_np)
                 base_switch.down_proj.weight = mx.array(down_layer_np)
+                if self.max_ram_budget_mb is not None and self.max_ram_budget_mb < 15800.0:
+                    q_bits = 4 if self.max_ram_budget_mb < 8200.0 else 8
+                    nn.quantize(base_switch, group_size=64, bits=q_bits)
                 mx.eval(base_switch.parameters())
                 switch_mlp = base_switch
 

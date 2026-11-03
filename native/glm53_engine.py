@@ -1104,7 +1104,10 @@ class NativeGLM53MerkleEngine:
                 s_raw = s_raw[:, col_slice[0] // bw : max(1, (col_slice[1] + bw - 1) // bw)]
 
             w_mx_u8 = mx.array(np.ascontiguousarray(w_raw, dtype=np.uint8))
-            w_f16 = mx.take(_MLX_FP8_LUT_F16, w_mx_u8)
+            if hasattr(mx, "from_fp8"):
+                w_f16 = mx.from_fp8(w_mx_u8, dtype=mx.bfloat16).astype(mx.float16)
+            else:
+                w_f16 = mx.take(_MLX_FP8_LUT_F16, w_mx_u8)
             s_f16 = mx.array(np.ascontiguousarray(s_raw, dtype=np.float16))
             out_dim, in_dim = int(w_f16.shape[0]), int(w_f16.shape[1])
             if out_dim % bh == 0 and in_dim % bw == 0:

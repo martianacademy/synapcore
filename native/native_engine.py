@@ -1225,6 +1225,28 @@ class AsyncThreeStagePipeline:
         self.executor.shutdown(wait=True)
 
 
+def _ensure_latest_lmstudio_mlx_runtime() -> Optional[str]:
+    """Auto-discovers the newest LM Studio _amphibian MLX runtime (e.g. @39 with mlx-0.32.3 + mlx-lm-0.31.4.dev132)."""
+    amp_dir = Path.home() / ".lmstudio/extensions/backends/vendor/_amphibian"
+    if not amp_dir.exists():
+        return None
+    cands = sorted(
+        amp_dir.glob("app-mlx-generate-mac*-arm64@*"),
+        key=lambda p: int(p.name.rsplit("@", 1)[-1]) if "@" in p.name and p.name.rsplit("@", 1)[-1].isdigit() else 0,
+        reverse=True,
+    )
+    for cand in cands:
+        py_bin = cand / "bin/python3"
+        sp = cand / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+        if sp.exists() and str(sp) not in sys.path:
+            sys.path.insert(0, str(sp))
+        if py_bin.exists():
+            return str(py_bin)
+    return None
+
+
+LMSTUDIO_LATEST_MLX_PYTHON: Optional[str] = _ensure_latest_lmstudio_mlx_runtime()
+
 # Detect Apple MLX C++/Metal Backend
 HAS_MLX_METAL: bool = False
 try:
@@ -1950,6 +1972,8 @@ if HAS_MLX_METAL:
 
             self.qkv_w: mx.array = mx.contiguous(qkv_w)
             self.o_w: mx.array = mx.contiguous(o_w)
+            self.qkv_w_T: mx.array = mx.contiguous(qkv_w.T)
+            self.o_w_T: mx.array = mx.contiguous(o_w.T)
 
             self.q_norm: Optional[nn.RMSNorm] = None
             self.k_norm: Optional[nn.RMSNorm] = None
@@ -1974,7 +1998,7 @@ if HAS_MLX_METAL:
             cache: Optional[KVCache] = None,
         ) -> mx.array:
             B, L, _ = x.shape
-            qkv = x @ self.qkv_w.T
+            qkv = x @ self.qkv_w_T
             if self.q_dim == self.kv_dim:
                 queries, keys, values = mx.split(qkv, 3, axis=-1)
             else:
@@ -2001,7 +2025,7 @@ if HAS_MLX_METAL:
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
             output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-            return output @ self.o_w.T
+            return output @ self.o_w_T
 
     class SynapCoreMLXLayer(nn.Module):
         def __init__(
@@ -2026,6 +2050,7 @@ if HAS_MLX_METAL:
             self.post_attention_layernorm.weight = post_norm_w
             self.self_attn = attn
             self.router_w: mx.array = mx.contiguous(router_w)
+            self.router_w_T: mx.array = mx.contiguous(router_w.T)
             self.router_b: Optional[mx.array] = router_b
             self.gpu_slot_map: Optional[mx.array] = gpu_slot_map
             self.layer_idx: int = int(layer_idx)
@@ -2055,12 +2080,12 @@ if HAS_MLX_METAL:
                 )
                 exec_indices = mx.take(self.gpu_slot_map, indices) if self.gpu_slot_map is not None else indices
             elif self.router_b is not None and self.gpu_slot_map is not None:
-                router_logits = x_flat @ self.router_w.T
+                router_logits = x_flat @ self.router_w_T
                 exec_indices, scores, _ = self.route_expanded_fn(
                     router_logits, self.router_b, self.gpu_slot_map
                 )
             else:
-                router_logits = x_flat @ self.router_w.T
+                router_logits = x_flat @ self.router_w_T
                 if self.router_b is not None:
                     router_logits = router_logits + self.router_b
                 indices, scores = self.route_fn(router_logits)
@@ -2085,12 +2110,12 @@ if HAS_MLX_METAL:
                 )
                 exec_indices = mx.take(self.gpu_slot_map, indices) if self.gpu_slot_map is not None else indices
             elif self.router_b is not None and self.gpu_slot_map is not None:
-                router_logits = x_flat @ self.router_w.T
+                router_logits = x_flat @ self.router_w_T
                 exec_indices, scores, indices = self.route_expanded_fn(
                     router_logits, self.router_b, self.gpu_slot_map
                 )
             else:
-                router_logits = x_flat @ self.router_w.T
+                router_logits = x_flat @ self.router_w_T
                 if self.router_b is not None:
                     router_logits = router_logits + self.router_b
                 indices, scores = self.route_fn(router_logits)
@@ -2640,6 +2665,7 @@ class NativeMerkleMoEEngine:
                     l_idx, base_rw, prof
                 )
                 layer_mod.router_w = mx.contiguous(mx.array(full_rw))
+                layer_mod.router_w_T = mx.contiguous(layer_mod.router_w.T)
                 layer_mod.router_b = mx.array(full_rb.astype(np.float16))
                 layer_mod.thalamic_v2 = active_v2
             mx.eval([l.router_w for l in self.mlx_layers], [l.router_b for l in self.mlx_layers if l.router_b is not None])
